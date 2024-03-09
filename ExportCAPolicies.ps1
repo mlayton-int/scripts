@@ -5,10 +5,9 @@ $modules = "Microsoft.Graph", "Microsoft.Graph.Beta"
 # Output path for JSON files
 $ExportPath = "C:\Temp"
 
-
+# Check if required modules are installed
 Write-Host "Checking if required PS modules are installed.."
 foreach ($item in $modules) {
-    # Check if required modules are installed
     if (Get-Module -ListAvailable -Name $item) {
         Write-Host "$item module is installed" -ForegroundColor Green
     }
