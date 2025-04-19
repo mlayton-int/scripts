@@ -1,19 +1,11 @@
-#Requires -RunAsAdministrator
-
-# Check administrator privileges
-if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    Write-Error "This script must be run as Administrator."
-    exit 1
-}
-
 # Define log file
 $logFile = "C:\INS-Temp\veeam_uninstall_log.txt"
 
 function Log {
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     Add-Content -Path $logFile -Value "$timestamp - $args"
+    Write-Host $args
 }
-
 function Get-VeeamPrograms {
     param (
         [string[]]$ExcludeKeywords = @()
@@ -49,22 +41,62 @@ function Get-VeeamPrograms {
 }
 
 # Begin main script
+
 $excludeList = @()
 
-Log "`n`n========== Script Started =========="
+Log "`n`n Script Started: "
+Log "Searching for Veeam services to disable."
+
+$services = Get-WmiObject -Class Win32_Service |
+    Where-Object { $_.State -eq 'Running' -and $_.Description -like '*Veeam*' }
+
+if ($services.Count -eq 0) {
+    Log "No running services found with 'Veeam' in the description."
+}
+else {
+    # List all matching services
+    Log "`nFound the following running services with 'Veeam' in the description:"
+    $services | ForEach-Object {
+        Log "Name: $($_.Name)"
+    }
+
+    # Prompt once
+    $response = Read-Host "Do you want to stop ALL of these services? (Y/N)"
+
+    if ($response -match '^[Yy]$') {
+        foreach ($svc in $services) {
+            Log "Stopping service: $($svc.Name)..."
+            try {
+                $result = $svc.StopService()
+                if ($result.ReturnValue -eq 0) {
+                    Log "Successfully stopped: $($svc.Name)"
+                } 
+                else {
+                    Log "Failed to stop: $($svc.Name) (ReturnValue: $($result.ReturnValue))"
+                }
+            } catch {
+                Log "Error stopping service $($svc.Name): $($_.Exception.Message)"
+            }
+        }
+    } 
+    else {
+        Log "No services were stopped."
+    }
+}
+
+Log "Beginning uninstall process.."
 
 do {
     $veeamPrograms = Get-VeeamPrograms -ExcludeKeywords $excludeList
 
     if ($veeamPrograms.Count -eq 0) {
-        Write-Host "No matching Veeam-related programs found."
         Log "No matching Veeam-related programs found. Exiting."
         exit
     }
 
-    Write-Host "`nFound the following Veeam-related programs:"
+    Log "`nFound the following Veeam-related programs:"
     $veeamPrograms | ForEach-Object {
-        Write-Host "- $($_.DisplayName)"
+        Log "- $($_.DisplayName)"
     }
 
     Write-Host "`nOptions:"
@@ -77,13 +109,12 @@ do {
     if ($choice -match '^[Ee]$') {
         $excludeInput = Read-Host "Enter words to exclude (comma-separated)"
         $excludeList = $excludeInput -split "," | ForEach-Object { $_.Trim() }
-        Write-Host "Excluding programs with keywords: $($excludeList -join ', ')"
+        Log "Excluding programs with keywords: $($excludeList -join ', ')"
     }
 
 } until ($choice -match '^[YyNn]$')
 
 if ($choice -match '^[Nn]$') {
-    Write-Host "Aborted by user."
     Log "User aborted the uninstall operation."
     exit
 }
@@ -93,7 +124,6 @@ foreach ($app in $veeamPrograms) {
     $displayName = $app.DisplayName
     $productCode = $app.PSChildName
 
-    Write-Host "Uninstalling: $displayName"
     Log "Uninstalling: $displayName"
 
     try {
@@ -101,8 +131,7 @@ foreach ($app in $veeamPrograms) {
         Log "SUCCESS: $displayName uninstalled"
     } catch {
         Log "ERROR: Failed to uninstall $displayName. $_"
-        Write-Host "Failed to uninstall $displayName. See log for details."
     }
 }
 
-Log "========== Script Ended ==========`n"
+Log "Script End`n"
