@@ -1,4 +1,4 @@
-
+# Creating time stamps
 function Get-TimeStamp {
     
     return "[{0:MM-dd-yyyy}][T{0:HH:mm:ss}]" -f (Get-Date)
@@ -6,6 +6,16 @@ function Get-TimeStamp {
 }
 
 Write-Host $(Get-TimeStamp)
+
+# Define log file
+$logFile = "C:\INS-Temp\veeam_uninstall_log.txt"
+
+function Log {
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    Add-Content -Path $logFile -Value "$timestamp - $args"
+    Write-Host $args
+}
+
 
 # Check administrator privileges
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -36,3 +46,5 @@ function ElevationCheck {
         }
     }
 }
+
+Select-Object
