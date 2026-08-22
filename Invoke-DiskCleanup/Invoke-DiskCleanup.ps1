@@ -1,7 +1,10 @@
 #Requires -Version 5.1
 <#
-.SYNOPSIS
-    Reclaims disk space on Windows 10/11 workstations without interrupting the logged-in user.
+.NOTES
+    Author  : Michael Layton (Assisted by Claude.ai | Static analysis and testing completed manually)
+    Version : 1.0.1
+    Context : SYSTEM  (required - the script enumerates all user profiles and system paths)
+    Exit    : 0 = success (including partial task failures, which are logged), 1 = fatal error
 
 .DESCRIPTION
     Unattended disk cleanup for Kaseya VSA X agent procedures. Designed to be aggressive about
@@ -9,7 +12,7 @@
 
     SAFETY MODEL
       - Allow-list only. Every path is explicitly named; there is no wildcard sweep of C:\.
-      - Every path passes Test-SafeCleanupPath before deletion (blocks drive roots, protected
+      - Every path passes safety checks before deletion (blocks drive roots, protected
         system folders, reparse points, and any path under C:\Users that is not inside AppData).
       - Age filters on everything. A file must be untouched for N days before it qualifies.
       - Reparse points (junctions/symlinks) are never traversed or deleted.
@@ -64,12 +67,6 @@
 
 .PARAMETER ReportOnly
     Measure and report reclaimable space without deleting anything.
-
-.NOTES
-    Author  : IT Operations
-    Version : 1.0
-    Context : SYSTEM  (required - the script enumerates all user profiles and system paths)
-    Exit    : 0 = success (including partial task failures, which are logged), 1 = fatal error
 #>
 
 [CmdletBinding()]
@@ -114,7 +111,7 @@ $ErrorActionPreference = 'Stop'
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 $ScriptName    = 'DiskCleanup'
-$ScriptVersion = '1.0'
+$ScriptVersion = '1.0.1'
 $LogDir        = 'C:\ProgramData\Kaseya\Logs'
 $LogPath       = "$LogDir\$ScriptName.log"
 $SummaryPath   = "$LogDir\${ScriptName}_Summary.json"
