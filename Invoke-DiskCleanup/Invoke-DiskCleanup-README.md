@@ -504,4 +504,4 @@ Points a change board will ask about, answered:
   `Write-Error $Message -ErrorAction Continue` rather than plain `Write-Error`. With
   `$ErrorActionPreference = 'Stop'`, the template version throws a terminating error whenever the
   script logs at ERROR level — including inside the final `catch`, which would skip
-  `Set-VSAResult` and the `exit 1`. The skill's own template should be corrected.
+  `Write-VSAResult` and the `exit 1`. The skill's own template should be corrected.

@@ -1,8 +1,8 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .NOTES
     Author  : Michael Layton (Assisted by Claude.ai | Static analysis and testing completed manually)
-    Version : 1.0.1
+    Version : 1.0.2
     Context : SYSTEM  (required - the script enumerates all user profiles and system paths)
     Exit    : 0 = success (including partial task failures, which are logged), 1 = fatal error
 
@@ -168,7 +168,7 @@ function Write-Log {
 }
 
 # ── VSA Result Helper ──────────────────────────────────────────────────────────
-function Set-VSAResult {
+function Write-VSAResult {
     param([string]$Result)
     if ($Result.Length -gt 480) { $Result = $Result.Substring(0,477) + '...' }
     try { $Result | Out-File -FilePath "C:\ProgramData\Kaseya\ScriptResult_$ScriptName.txt" -Encoding UTF8 -Force } catch { }
@@ -315,7 +315,7 @@ function Test-SafeCleanupPath {
 function Clear-PathAgedFiles {
     <#
         Walks $Path manually (never following reparse points), deletes files whose LastWriteTime
-        is older than $OlderThanDays, and reports bytes/items. Honours -ReportOnly and the deadline.
+        is older than $OlderThanDays, and reports bytes/items. Honors -ReportOnly and the deadline.
     #>
     param(
         [Parameter(Mandatory)][string]$Path,
@@ -445,7 +445,7 @@ try {
 
     if ($RunOnlyIfFreeSpaceBelowGB -gt 0 -and $freeBefore -ge ($RunOnlyIfFreeSpaceBelowGB * 1GB)) {
         Write-Log "Free space already above ${RunOnlyIfFreeSpaceBelowGB} GB threshold. Nothing to do."
-        Set-VSAResult ("SUCCESS: Skipped - free space {0} already above {1} GB threshold." -f (Format-Bytes $freeBefore), $RunOnlyIfFreeSpaceBelowGB)
+        Write-VSAResult ("SUCCESS: Skipped - free space {0} already above {1} GB threshold." -f (Format-Bytes $freeBefore), $RunOnlyIfFreeSpaceBelowGB)
         exit 0
     }
 
@@ -929,7 +929,7 @@ try {
     Write-Log "=== $ScriptName COMPLETE ==="
 
     $verb = if ($ReportOnly) { 'Reclaimable' } else { 'Reclaimed' }
-    Set-VSAResult ("SUCCESS: {0} {1}. Free {2} -> {3} of {4}. Top: {5}.{6}" -f `
+    Write-VSAResult ("SUCCESS: {0} {1}. Free {2} -> {3} of {4}. Top: {5}.{6}" -f `
                    $verb,
                    (Format-Bytes $reportedSum),
                    (Format-Bytes $freeBefore),
@@ -941,6 +941,6 @@ try {
 }
 catch {
     Write-Log "Unhandled error: $_" -Level ERROR
-    Set-VSAResult "FAILURE: $_"
+    Write-VSAResult "FAILURE: $_"
     exit 1
 }
