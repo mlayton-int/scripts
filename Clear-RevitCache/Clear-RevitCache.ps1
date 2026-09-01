@@ -14,11 +14,16 @@
 
 .NOTES
     Cache path pattern cleaned:
-        C:\Users\<profile>\AppData\Local\Autodesk\Revit\Autodesk Revit *\CollaborationCache
+        <ProfileRoot>\<profile>\AppData\Local\Autodesk\Revit\Autodesk Revit *\CollaborationCache
+
+    <ProfileRoot> defaults to the system's configured ProfilesDirectory (normally
+    C:\Users) and can be overridden with the $ProfileRoot configuration variable.
 #>
 
 [CmdletBinding()]
 param()
+
+Set-StrictMode -Version Latest
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CONFIGURATION - edit these values before deploying
@@ -27,8 +32,11 @@ param()
 # Path to write the cleanup log.
 $LogPath = "C:\INS-Temp\Clear-RevitCache.log"
 
+# Roll the log over to <LogPath>.1 once it exceeds this size.
+$MaxLogSizeMB = 5
+
 # Only delete cache files whose LastWriteTime is older than this many days.
-$MaxAgeDays = 1
+$MaxAgeDays = 7
 
 # When $true, measure and report what would be freed without deleting anything.
 $ReportOnly = $false
@@ -38,12 +46,16 @@ $ReportOnly = $false
 # churning the cache for a negligible gain. Fractional values (0.5) are allowed.
 [double]$MinSpaceToFreeGB = 0
 
-# Profile folder names under C:\Users to skip.
+# Root folder containing user profiles. Leave empty to auto-detect.
+$ProfileRoot = ''
+
+# Profile folder names under the profile root to skip.
 $ExcludedProfiles = @('Public', 'Default', 'Default User', 'All Users')
 
 # ── Exit codes ────────────────────────────────────────────────────────────────
 $EXIT_SUCCESS         = 0
 $EXIT_FAILURE         = 1
+$EXIT_PREREQ          = 2
 $EXIT_PARTIAL         = 3
 $EXIT_BELOW_THRESHOLD = 4
 
@@ -57,13 +69,38 @@ $failed            = 0
 $reclaimableBytes  = $null
 $skippedBelowThreshold = $false
 
+# Out-of-band return channel for Invoke-CachePass (see the note in that function).
+$script:LastPassTotals = $null
+
 $thresholdEnabled  = $MinSpaceToFreeGB -gt 0
 $thresholdBytes    = $MinSpaceToFreeGB * 1GB
 
 # ── Logging ───────────────────────────────────────────────────────────────────
+# Runs before the main try/finally, so a failure here cannot be logged - report it
+# on the error stream and exit with the prerequisite code.
 $logDir = Split-Path $LogPath -Parent
-if (-not (Test-Path $logDir)) {
-    New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+try {
+    if (-not (Test-Path -LiteralPath $logDir -PathType Container)) {
+        New-Item -ItemType Directory -Path $logDir -Force -ErrorAction Stop | Out-Null
+    }
+    # New-Item can report success without creating anything (for example when a
+    # parent path component is a file), so verify rather than trust it.
+    if (-not (Test-Path -LiteralPath $logDir -PathType Container)) {
+        throw "directory does not exist after the creation attempt"
+    }
+    # Prove the log is actually writable now. Write-Log swallows errors by design,
+    # so without this probe an unwritable log would disable logging silently.
+    [IO.File]::AppendAllText($LogPath, '')
+} catch {
+    Write-Error "Cannot initialise logging at '$LogPath': $_"
+    exit $EXIT_PREREQ
+}
+
+# Roll the log over once it outgrows the cap, keeping a single archive.
+# Best-effort: rotation trouble must never block a cleanup run.
+$logItem = Get-Item -LiteralPath $LogPath -ErrorAction SilentlyContinue
+if ($logItem -and $logItem.Length -gt ($MaxLogSizeMB * 1MB)) {
+    Move-Item -LiteralPath $LogPath -Destination "$LogPath.1" -Force -ErrorAction SilentlyContinue
 }
 
 function Write-Log {
@@ -74,7 +111,10 @@ function Write-Log {
     )
     $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
     $entry = "[$timestamp][$Level] $Message"
-    Add-Content -Path $LogPath -Value $entry -Encoding UTF8
+    # Logging is best-effort - a locked or unwritable log must not derail the run.
+    # The failure is still diagnosable via -Debug; console output below is unaffected.
+    try   { Add-Content -LiteralPath $LogPath -Value $entry -Encoding UTF8 -ErrorAction Stop }
+    catch { Write-Debug "Log write failed: $_" }
     switch ($Level) {
         'ERROR' { Write-Error   $Message }
         'WARN'  { Write-Warning $Message }
@@ -83,11 +123,28 @@ function Write-Log {
     }
 }
 
+# ── Helper: locate the profile root ───────────────────────────────────────────
+function Get-ProfileRoot {
+    # The profile root is not always C:\Users - it can be relocated, and the system
+    # drive is not always C:. Fall back only if the registry lookup fails.
+    try {
+        $key = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList'
+        $dir = (Get-ItemProperty -Path $key -Name 'ProfilesDirectory' -ErrorAction Stop).ProfilesDirectory
+        # ProfilesDirectory is REG_EXPAND_SZ, normally '%SystemDrive%\Users'.
+        return [Environment]::ExpandEnvironmentVariables($dir)
+    } catch {
+        return (Join-Path $env:SystemDrive 'Users')
+    }
+}
+
 # ── Helper: find each profile's CollaborationCache folder(s) ─────────────────
 function Get-RevitCollaborationCachePath {
-    param([string[]]$ExcludedProfiles)
+    param(
+        [Parameter(Mandatory)][string]$ProfileRoot,
+        [string[]]$ExcludedProfiles
+    )
 
-    $profiles = Get-ChildItem -Path 'C:\Users' -Directory -ErrorAction SilentlyContinue |
+    $profiles = Get-ChildItem -Path $ProfileRoot -Directory -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -notin $ExcludedProfiles }
 
     foreach ($user in $profiles) {
@@ -125,8 +182,18 @@ function Clear-CacheFolder {
         Failed     = 0
     }
 
+    # Containment guard. Verified on Windows PowerShell 5.1: -Recurse does NOT walk
+    # into directory junctions, so the tree cannot escape that way. These two checks
+    # cover the rest - a symlinked file (delete the link, never the target) and any
+    # path that somehow resolves outside the cache folder.
+    $containmentRoot = [IO.Path]::GetFullPath($CachePath).TrimEnd('\') + '\'
+
     $staleFiles = Get-ChildItem -Path $CachePath -File -Recurse -ErrorAction SilentlyContinue |
-        Where-Object { $_.LastWriteTime -lt $cutoff }
+        Where-Object {
+            $_.LastWriteTime -lt $cutoff -and
+            -not $_.Attributes.HasFlag([IO.FileAttributes]::ReparsePoint) -and
+            $_.FullName.StartsWith($containmentRoot, [StringComparison]::OrdinalIgnoreCase)
+        }
 
     foreach ($file in $staleFiles) {
         $size = $file.Length
@@ -183,12 +250,18 @@ function Invoke-CachePass {
         Write-Log "  [$($target.ProfileName)] $fileVerb $($result.Files) file(s), ${folderMB}MB, $($result.Failed) failure(s)." -Level $LogLevel
     }
 
-    return $totals
+    # Write-Log emits INFO lines on the success stream, so returning $totals through
+    # the pipeline would hand the caller [log strings..., $totals] rather than the
+    # object. Pass it back out of band instead.
+    $script:LastPassTotals = $totals
 }
 
 # ═════════════════════════════════════════════════════════════════════════════
+$resolvedProfileRoot = if ($ProfileRoot) { $ProfileRoot } else { Get-ProfileRoot }
+
 Write-Log "===== Clear-RevitCache started | Host: $env:COMPUTERNAME | User: $env:USERNAME ====="
 Write-Log "LogPath        : $LogPath"
+Write-Log "ProfileRoot    : $resolvedProfileRoot"
 Write-Log "MaxAgeDays     : $MaxAgeDays"
 Write-Log "ReportOnly     : $ReportOnly"
 $thresholdLabel = if ($thresholdEnabled) { "${MinSpaceToFreeGB}GB" } else { 'disabled' }
@@ -197,7 +270,23 @@ if ($ReportOnly) { Write-Log "*** REPORT ONLY MODE - no files will be deleted **
 
 try {
 
-    $cacheTargets = @(Get-RevitCollaborationCachePath -ExcludedProfiles $ExcludedProfiles)
+    # ── Configuration validation ───────────────────────────────────────────────
+    # MaxAgeDays = 0 puts the cutoff at "now", which selects essentially the whole
+    # cache including files in active use. Use return, not throw (the catch would
+    # rewrite it to EXIT_FAILURE) and not exit (which skips the finally's summary).
+    if ($MaxAgeDays -lt 1) {
+        Write-Log "MaxAgeDays must be 1 or greater (configured: $MaxAgeDays). Refusing to run." -Level ERROR
+        $exitCode = $EXIT_PREREQ
+        return
+    }
+    if ($MinSpaceToFreeGB -lt 0) {
+        Write-Log "MinSpaceToFreeGB cannot be negative (configured: $MinSpaceToFreeGB). Refusing to run." -Level ERROR
+        $exitCode = $EXIT_PREREQ
+        return
+    }
+
+    $cacheTargets = @(Get-RevitCollaborationCachePath -ProfileRoot $resolvedProfileRoot `
+                                                      -ExcludedProfiles $ExcludedProfiles)
 
     if ($cacheTargets.Count -eq 0) {
         # Deliberately ahead of the gate: a workstation with no Revit cache at all
@@ -212,8 +301,9 @@ try {
         # default configuration still makes exactly one pass.
         if ($ReportOnly -or $thresholdEnabled) {
             $measureLevel = if ($ReportOnly) { 'INFO' } else { 'DEBUG' }
-            $measured = Invoke-CachePass -Targets $cacheTargets -MaxAgeDays $MaxAgeDays `
-                                         -Measure $true -LogLevel $measureLevel
+            Invoke-CachePass -Targets $cacheTargets -MaxAgeDays $MaxAgeDays `
+                             -Measure $true -LogLevel $measureLevel
+            $measured = $script:LastPassTotals
             $reclaimableBytes = $measured.Bytes
         }
 
@@ -229,7 +319,8 @@ try {
             $foldersProcessed      = $measured.Folders
 
         } else {
-            $pass = Invoke-CachePass -Targets $cacheTargets -MaxAgeDays $MaxAgeDays -Measure $false
+            Invoke-CachePass -Targets $cacheTargets -MaxAgeDays $MaxAgeDays -Measure $false
+            $pass = $script:LastPassTotals
             $foldersProcessed = $pass.Folders
             $filesAffected    = $pass.Files
             $bytesFreed       = $pass.Bytes

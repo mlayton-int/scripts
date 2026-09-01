@@ -1,5 +1,48 @@
 # Changelog — Clear-RevitCache.ps1
 
+## 2026-09-01 (hardening)
+
+Reliability and safety pass. Two latent bugs were found by the new guards themselves:
+
+- **Fixed: `Invoke-CachePass` was returning log text, not just its totals.** `Write-Log`
+  emits INFO lines with `Write-Output`, so the function returned
+  `[log strings..., $totals]`. It only appeared to work because PowerShell's member
+  enumeration silently plucked `.Folders`/`.Bytes` out of the mixed array. The totals now
+  come back via `$script:LastPassTotals` instead of the polluted pipeline. Surfaced
+  immediately by `Set-StrictMode`.
+- **Fixed: the log-directory guard could pass without a usable log.**
+  `New-Item -ItemType Directory -Force -ErrorAction Stop` reports success without creating
+  anything when a parent path component is a file. The guard now verifies the directory
+  exists afterwards and write-probes the log, rather than trusting the return.
+
+Changes:
+
+- Added `Set-StrictMode -Version Latest`.
+- Added exit code `2` (`$EXIT_PREREQ`) for prerequisite failures, making real the contract
+  the help text already documented.
+- `$MaxAgeDays` is validated as `>= 1`. `0` put the cutoff at "now", which selected
+  essentially the whole cache including files in active use — the most destructive typo
+  the config allowed. A negative `$MinSpaceToFreeGB` is rejected too, rather than silently
+  reading as "gate disabled".
+- Log initialisation failures now exit `2` with a clear message instead of crashing before
+  logging exists.
+- Containment guard in `Clear-CacheFolder`: files carrying the `ReparsePoint` attribute and
+  anything resolving outside the cache root are skipped. Verified empirically that
+  Windows PowerShell 5.1 `Get-ChildItem -Recurse` does **not** walk into directory
+  junctions, so the heavier manual-walk rewrite used by the sibling script was unnecessary
+  here.
+- Profile root is no longer hardcoded to `C:\Users`. It reads `ProfilesDirectory` from the
+  registry, falls back to `$env:SystemDrive\Users`, and can be overridden with the new
+  `$ProfileRoot` config variable.
+- Log rotation: rolls to `<LogPath>.1` past `$MaxLogSizeMB` (default 5), keeping one
+  archive. The log previously appended forever.
+- `Write-Log` no longer lets a locked or unwritable log derail a run; the failure is
+  visible under `-Debug`.
+
+**Considered and declined:** a guard refusing to delete while Revit is running. The
+`LastWriteTime` filter can select files belonging to a live workshared session, so this
+remains the largest residual risk — reopen deliberately if that changes.
+
 ## 2026-09-01 (later)
 
 - Added a `$MinSpaceToFreeGB` configuration variable acting as a **worthwhile gate**: the
