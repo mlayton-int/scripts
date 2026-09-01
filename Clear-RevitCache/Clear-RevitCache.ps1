@@ -5,21 +5,11 @@
     profile on a workstation.
 
 .DESCRIPTION
-    Iterates over each local user profile under C:\Users (excluding Public, Default,
-    Default User, and All Users), locates any installed Revit version's Collaboration
-    Cache folder:
-
-        <Profile>\AppData\Local\Autodesk\Revit\Autodesk Revit <version>\CollaborationCache
-
-    and deletes cached files older than $MaxAgeDays. Files locked by a running Revit
-    session are logged as warnings and skipped rather than aborting the run.
-
-    Set the $ReportOnly configuration variable to $true to perform the identical
-    discovery and staleness filter, report how much space would be reclaimed, and delete
-    nothing. A report-only run always exits 0.
-
-    Exits with code 0 on full success, 3 on partial failure (some files could not be
-    deleted), 1 on total failure, and 2 on prerequisite errors.
+    Scans each local user profile's Revit Collaboration Cache folder(s) and deletes
+    files older than $MaxAgeDays; locked files are logged as warnings and skipped.
+    Set $ReportOnly to $true to log what would be freed without deleting anything
+    (always exits 0). Otherwise exits 0 on success, 3 on partial failure, 1 on total
+    failure, 2 on prerequisite errors.
 
 .NOTES
     Cache path pattern cleaned:
