@@ -1,4 +1,5 @@
-﻿#Requires -RunAsAdministrator
+﻿#Requires -Version 5.1
+#Requires -RunAsAdministrator
 <#
 .SYNOPSIS
     Cleans up stale Autodesk Revit Collaboration Cache files for every local user
@@ -16,8 +17,16 @@
     Cache path pattern cleaned:
         <ProfileRoot>\<profile>\AppData\Local\Autodesk\Revit\Autodesk Revit *\CollaborationCache
 
-    <ProfileRoot> defaults to the system's configured ProfilesDirectory (normally
-    C:\Users) and can be overridden with the $ProfileRoot configuration variable.
+    Configuration variables (edit at the top of the script):
+        $LogPath          Log file location.
+        $MaxLogSizeMB     Roll the log to <LogPath>.1 once it exceeds this size.
+        $MaxAgeDays       Delete cache files older than this. Minimum 1.
+        $ReportOnly       Measure and report without deleting anything.
+        $MinSpaceToFreeGB Only delete if at least this much is reclaimable. 0 = always.
+        $ProfileRoot      Profile root folder. Empty = auto-detect from the registry
+                          (the configured ProfilesDirectory, normally C:\Users).
+        $ExcludedProfiles Profile folder names to skip.
+
 #>
 
 [CmdletBinding()]
@@ -68,6 +77,7 @@ $failed            = 0
 # Set by the measure pass; stays $null when no measure pass runs.
 $reclaimableBytes  = $null
 $skippedBelowThreshold = $false
+$noCacheTargets        = $false
 
 # Out-of-band return channel for Invoke-CachePass (see the note in that function).
 $script:LastPassTotals = $null
@@ -106,21 +116,30 @@ if ($logItem -and $logItem.Length -gt ($MaxLogSizeMB * 1MB)) {
 function Write-Log {
     param(
         [string]$Message,
-        [ValidateSet('INFO', 'WARN', 'ERROR', 'DEBUG')]
+        # VERBOSE routes to Write-Verbose, so those lines need -Verbose to appear
+        # (not -Debug). INFO goes to the success stream, which is why callers must
+        # select the summary object by type - see .NOTES.
+        [ValidateSet('INFO', 'WARN', 'ERROR', 'VERBOSE')]
         [string]$Level = 'INFO'
     )
     $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
     $entry = "[$timestamp][$Level] $Message"
     # Logging is best-effort - a locked or unwritable log must not derail the run.
-    # The failure is still diagnosable via -Debug; console output below is unaffected.
+    # The failure itself is diagnosable via -Debug; console output below is unaffected.
     try   { Add-Content -LiteralPath $LogPath -Value $entry -Encoding UTF8 -ErrorAction Stop }
     catch { Write-Debug "Log write failed: $_" }
     switch ($Level) {
-        'ERROR' { Write-Error   $Message }
-        'WARN'  { Write-Warning $Message }
-        'DEBUG' { Write-Verbose $Message }
-        default { Write-Output  $Message }
+        'ERROR'   { Write-Error   $Message }
+        'WARN'    { Write-Warning $Message }
+        'VERBOSE' { Write-Verbose $Message }
+        default   { Write-Output  $Message }
     }
+}
+
+# ── Helper: bytes to MB, the unit used throughout the log ─────────────────────
+function ConvertTo-MB {
+    param([double]$Bytes)
+    return [math]::Round($Bytes / 1MB, 1)
 }
 
 # ── Helper: locate the profile root ───────────────────────────────────────────
@@ -144,7 +163,9 @@ function Get-RevitCollaborationCachePath {
         [string[]]$ExcludedProfiles
     )
 
-    $profiles = Get-ChildItem -Path $ProfileRoot -Directory -ErrorAction SilentlyContinue |
+    # -LiteralPath throughout: profile names may legally contain [ ] * ?, which -Path
+    # would interpret as wildcards and silently fail to match the real folder.
+    $profiles = Get-ChildItem -LiteralPath $ProfileRoot -Directory -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -notin $ExcludedProfiles }
 
     foreach ($user in $profiles) {
@@ -153,7 +174,7 @@ function Get-RevitCollaborationCachePath {
             continue
         }
 
-        $versionDirs = Get-ChildItem -Path $revitRoot -Directory -Filter 'Autodesk Revit *' -ErrorAction SilentlyContinue
+        $versionDirs = Get-ChildItem -LiteralPath $revitRoot -Directory -Filter 'Autodesk Revit *' -ErrorAction SilentlyContinue
         foreach ($versionDir in $versionDirs) {
             $cachePath = Join-Path $versionDir.FullName 'CollaborationCache'
             if (Test-Path -LiteralPath $cachePath) {
@@ -188,7 +209,7 @@ function Clear-CacheFolder {
     # path that somehow resolves outside the cache folder.
     $containmentRoot = [IO.Path]::GetFullPath($CachePath).TrimEnd('\') + '\'
 
-    $staleFiles = Get-ChildItem -Path $CachePath -File -Recurse -ErrorAction SilentlyContinue |
+    $staleFiles = Get-ChildItem -LiteralPath $CachePath -File -Recurse -ErrorAction SilentlyContinue |
         Where-Object {
             $_.LastWriteTime -lt $cutoff -and
             -not $_.Attributes.HasFlag([IO.FileAttributes]::ReparsePoint) -and
@@ -225,9 +246,9 @@ function Invoke-CachePass {
         [Parameter(Mandatory)][int]$MaxAgeDays,
         # $true measures without deleting; $false deletes.
         [bool]$Measure = $false,
-        # The gate's measure pass logs at DEBUG so a gated delete run does not
+        # The gate's measure pass logs at VERBOSE so a gated delete run does not
         # print two sets of per-folder lines.
-        [ValidateSet('INFO', 'DEBUG')][string]$LogLevel = 'INFO'
+        [ValidateSet('INFO', 'VERBOSE')][string]$LogLevel = 'INFO'
     )
 
     $totals = [PSCustomObject]@{ Folders = 0; Files = 0; Bytes = 0; Failed = 0 }
@@ -246,7 +267,7 @@ function Invoke-CachePass {
         $totals.Bytes  += $result.BytesFreed
         $totals.Failed += $result.Failed
 
-        $folderMB = [math]::Round($result.BytesFreed / 1MB, 1)
+        $folderMB = ConvertTo-MB $result.BytesFreed
         Write-Log "  [$($target.ProfileName)] $fileVerb $($result.Files) file(s), ${folderMB}MB, $($result.Failed) failure(s)." -Level $LogLevel
     }
 
@@ -292,6 +313,7 @@ try {
         # Deliberately ahead of the gate: a workstation with no Revit cache at all
         # should report "nothing to do", not "below threshold".
         Write-Log "No Revit Collaboration Cache folders found on this workstation." -Level WARN
+        $noCacheTargets = $true
         $exitCode = $EXIT_SUCCESS
     } else {
         Write-Log "Found $($cacheTargets.Count) Collaboration Cache folder(s) across user profiles."
@@ -300,7 +322,7 @@ try {
         # gate. Skipped entirely when the gate is off and we are deleting, so the
         # default configuration still makes exactly one pass.
         if ($ReportOnly -or $thresholdEnabled) {
-            $measureLevel = if ($ReportOnly) { 'INFO' } else { 'DEBUG' }
+            $measureLevel = if ($ReportOnly) { 'INFO' } else { 'VERBOSE' }
             Invoke-CachePass -Targets $cacheTargets -MaxAgeDays $MaxAgeDays `
                              -Measure $true -LogLevel $measureLevel
             $measured = $script:LastPassTotals
@@ -329,15 +351,21 @@ try {
     }
 
     # ── Summary ────────────────────────────────────────────────────────────────
-    $freedMB       = [math]::Round($bytesFreed / 1MB, 1)
+    $freedMB       = ConvertTo-MB $bytesFreed
     $reclaimableGB = if ($null -ne $reclaimableBytes) { [math]::Round($reclaimableBytes / 1GB, 2) } else { $null }
     # Report reclaimable in MB like the rest of the script: rounding a few MB to GB
     # collapses to "0GB", which reads as "nothing to reclaim" when there is plenty.
-    $reclaimableMB = if ($null -ne $reclaimableBytes) { [math]::Round($reclaimableBytes / 1MB, 1) } else { $null }
+    $reclaimableMB = if ($null -ne $reclaimableBytes) { ConvertTo-MB $reclaimableBytes } else { $null }
 
     Write-Log "-------------------------------------------"
 
-    if ($skippedBelowThreshold) {
+    if ($noCacheTargets) {
+        # No cache anywhere: not a cleanup, not a threshold miss. Report one outcome
+        # rather than following up the discovery warning with "completed successfully".
+        Write-Log "Summary: No Revit Collaboration Cache folders present - nothing to do."
+        $exitCode = $EXIT_SUCCESS
+
+    } elseif ($skippedBelowThreshold) {
         Write-Log "Summary: Folders=$foldersProcessed | Reclaimable=${reclaimableMB}MB | Threshold=${MinSpaceToFreeGB}GB | Deleted=0"
         Write-Log "Reclaimable ${reclaimableMB}MB is below the ${MinSpaceToFreeGB}GB threshold - skipping deletion." -Level WARN
         $exitCode = $EXIT_BELOW_THRESHOLD
@@ -352,7 +380,9 @@ try {
         # including when the threshold would not have been met.
         if ($ReportOnly) {
             Write-Log "Report-only scan completed. ${freedMB}MB in $filesAffected file(s) would be reclaimed."
-            if ($thresholdEnabled) {
+            # $null -ne guard: a null $reclaimableBytes would coerce to 0 and always
+            # report "would not meet", with an empty number in the message.
+            if ($thresholdEnabled -and $null -ne $reclaimableBytes) {
                 if ($reclaimableBytes -ge $thresholdBytes) {
                     Write-Log "Would meet the ${MinSpaceToFreeGB}GB threshold (${reclaimableMB}MB reclaimable)."
                 } else {
@@ -377,7 +407,11 @@ try {
                     elseif ($null -ne $reclaimableBytes) { $reclaimableBytes -ge $thresholdBytes }
                     else                                 { $null }
 
-    # Emit totals to the pipeline so callers need not parse the log.
+    # Summary object for in-process callers. Write-Log INFO lines share the success
+    # stream, and the finally block logs after this, so it is neither the only nor
+    # the last item. Select it with -isnot [string]; -is [PSCustomObject] does not
+    # discriminate here because pipeline items are PSObject-wrapped.
+    #     & .\Clear-RevitCache.ps1 | Where-Object { $_ -isnot [string] }
     [PSCustomObject]@{
         ReportOnly            = [bool]$ReportOnly
         Folders               = $foldersProcessed

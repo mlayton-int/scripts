@@ -1,5 +1,41 @@
 # Changelog — Clear-RevitCache.ps1
 
+## 2026-09-01 (audit)
+
+Full read-through after several rounds of feature work. Three real defects, each with a
+regression test proven to fail against the previous code:
+
+- **Fixed: profile names containing `[`, `]`, `*` or `?` were silently skipped.** Three
+  enumerations used `-Path`, which treats those as wildcard patterns, so a legal Windows
+  account like `John[Doe]` had its cache go undiscovered — no error, no log line, nothing
+  cleaned. Now `-LiteralPath` throughout, matching the `Test-Path` call that already used
+  it.
+- **Fixed: malformed threshold line when no cache folders exist.** In report mode with a
+  threshold set, a `$null` reclaimable total coerced to `0` and always reported
+  `Would NOT meet the 2GB threshold ( MB reclaimable).` — an empty number, and wrong in
+  substance, since a machine with no Revit cache is not "below threshold". Resolved by the
+  new no-targets branch plus a `$null` guard on the comparison.
+- **Fixed: the summary object's documented contract was false.** The code claimed callers
+  need not parse the log, but `Write-Log` INFO lines share the success stream, so the
+  object is neither the only nor the last item — the `finally` block logs after it. Stream
+  behavior is deliberately unchanged (RMM console capture depends on it); the help and the
+  emit-site comment now document the real access pattern:
+  `& .\Clear-RevitCache.ps1 | Where-Object { $_ -isnot [string] }`. Note `-isnot [string]`
+  rather than `-is [PSCustomObject]`: pipeline items are PSObject-wrapped, so the latter
+  matches every log line too.
+
+Cleanups:
+
+- A machine with no Revit cache now reports one coherent outcome instead of a WARN that
+  none was found followed by "Cache cleanup completed successfully".
+- Renamed log level `DEBUG` → `VERBOSE`. It routes to `Write-Verbose`, so it surfaces
+  under `-Verbose`, not `-Debug` — confusing next to the `Write-Debug` in the same
+  function. Log prefix changes from `[DEBUG]` to `[VERBOSE]`.
+- Extracted `ConvertTo-MB`, replacing three copies of `[math]::Round($x / 1MB, 1)`. The
+  single GB rounding stays inline.
+- Documented all configuration variables in `.NOTES`.
+- Added `#Requires -Version 5.1`, matching the sibling script.
+
 ## 2026-09-01 (hardening)
 
 Reliability and safety pass. Two latent bugs were found by the new guards themselves:
