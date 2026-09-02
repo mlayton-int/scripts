@@ -1,5 +1,9 @@
-﻿#Requires -Version 5.1
+﻿# Keep the blank line between #Requires and the <# help block below. In Windows
+# PowerShell 5.1 ANY non-blank line abutting the help block - a #Requires or even
+# a comment - suppresses it, and Get-Help returns only a bare syntax line.
+#Requires -Version 5.1
 #Requires -RunAsAdministrator
+
 <#
 .SYNOPSIS
     Cleans up stale Autodesk Revit Collaboration Cache files for every local user
@@ -26,6 +30,21 @@
         $ProfileRoot      Profile root folder. Empty = auto-detect from the registry
                           (the configured ProfilesDirectory, normally C:\Users).
         $ExcludedProfiles Profile folder names to skip.
+        $SkipProfilesWithRevitRunning
+                          Skip profiles whose user has Revit running, protecting live
+                          workshared sessions. Other profiles are still cleaned.
+        $RevitProcessNames
+                          Process names that mark a profile as in use.
+
+    Exit codes, in order of precedence (highest wins):
+        6  A Revit process is running but its owner could not be determined, so no
+           profile could be proven safe. Nothing was deleted.
+        1  Total failure - every deletion failed.
+        3  Partial failure - some files could not be deleted.
+        5  One or more profiles were skipped because Revit was running for them.
+        4  Below the $MinSpaceToFreeGB threshold; nothing was deleted.
+        2  Prerequisite error (bad configuration, or logging could not start).
+        0  Success, including "nothing to do". Report-only runs always exit 0.
 
 #>
 
@@ -48,12 +67,12 @@ $MaxLogSizeMB = 5
 $MaxAgeDays = 7
 
 # When $true, measure and report what would be freed without deleting anything.
-$ReportOnly = $false
+$ReportOnly = $true
 
 # Only delete if at least this many GB can be reclaimed. 0 = always clean.
 # Clearing the cache forces Revit to re-download from BIM 360, so this avoids
 # churning the cache for a negligible gain. Fractional values (0.5) are allowed.
-[double]$MinSpaceToFreeGB = 0
+[double]$MinSpaceToFreeGB = 3
 
 # Root folder containing user profiles. Leave empty to auto-detect.
 $ProfileRoot = ''
@@ -61,12 +80,22 @@ $ProfileRoot = ''
 # Profile folder names under the profile root to skip.
 $ExcludedProfiles = @('Public', 'Default', 'Default User', 'All Users')
 
+# Skip profiles whose user currently has Revit running. The staleness filter is
+# LastWriteTime, so a model open right now can have days-old cache files - deleting
+# them risks corruption or lost unsynced work, not just a slow re-download.
+$SkipProfilesWithRevitRunning = $true
+
+# Process names that mark a profile as in use.
+$RevitProcessNames = @('Revit.exe')
+
 # ── Exit codes ────────────────────────────────────────────────────────────────
 $EXIT_SUCCESS         = 0
 $EXIT_FAILURE         = 1
 $EXIT_PREREQ          = 2
 $EXIT_PARTIAL         = 3
 $EXIT_BELOW_THRESHOLD = 4
+$EXIT_SKIPPED         = 5
+$EXIT_OWNER_UNKNOWN   = 6
 
 $exitCode          = $EXIT_SUCCESS
 $foldersProcessed  = 0
@@ -78,6 +107,11 @@ $failed            = 0
 $reclaimableBytes  = $null
 $skippedBelowThreshold = $false
 $noCacheTargets        = $false
+
+# Profiles the Revit-running guard held back, and PIDs it could not attribute.
+$skippedProfiles   = @()
+$ownerUnknownPids  = @()
+$allTargetsSkipped = $false
 
 # Out-of-band return channel for Invoke-CachePass (see the note in that function).
 $script:LastPassTotals = $null
@@ -180,11 +214,62 @@ function Get-RevitCollaborationCachePath {
             if (Test-Path -LiteralPath $cachePath) {
                 [PSCustomObject]@{
                     ProfileName = $user.Name
+                    ProfilePath = $user.FullName
                     CachePath   = $cachePath
                 }
             }
         }
     }
+}
+
+# ── Helper: which profiles currently have Revit running ───────────────────────
+function Get-RevitInUseProfile {
+    <#
+        Returns the profile folders that own a running Revit process, plus the PIDs of
+        any Revit process whose owner could not be determined.
+
+        Deliberately does no logging: Write-Log INFO writes to the success stream, so a
+        function that logs cannot cleanly return an object. The caller does the logging.
+    #>
+    param([string[]]$ProcessNames)
+
+    $inUse = New-Object System.Collections.Generic.HashSet[string] ([StringComparer]::OrdinalIgnoreCase)
+    $unknown = @()
+
+    if (-not $ProcessNames -or $ProcessNames.Count -eq 0) {
+        return [PSCustomObject]@{ InUsePaths = $inUse; UnknownOwnerPids = $unknown }
+    }
+
+    # Map SID -> profile folder. Matching on SID rather than username avoids assuming
+    # the profile folder is named after the user; duplicates become user.DOMAIN or
+    # user.000.
+    $sidToPath = @{}
+    foreach ($prof in (Get-CimInstance -ClassName Win32_UserProfile -ErrorAction SilentlyContinue)) {
+        if ($prof.SID -and $prof.LocalPath) { $sidToPath[$prof.SID] = $prof.LocalPath }
+    }
+
+    # One enumeration, filtered in PowerShell. Building a WQL -Filter from a
+    # config-supplied name would need quote escaping for no benefit.
+    $procs = Get-CimInstance -ClassName Win32_Process -ErrorAction SilentlyContinue |
+        Where-Object { $ProcessNames -contains $_.Name }
+
+    foreach ($proc in $procs) {
+        $sid = $null
+        try {
+            $owner = Invoke-CimMethod -InputObject $proc -MethodName GetOwnerSid -ErrorAction Stop
+            if ($owner.ReturnValue -eq 0) { $sid = $owner.Sid }
+        } catch {
+            Write-Debug "GetOwnerSid failed for PID $($proc.ProcessId): $_"
+        }
+
+        if ($sid -and $sidToPath.ContainsKey($sid)) {
+            [void]$inUse.Add($sidToPath[$sid].TrimEnd('\'))
+        } else {
+            $unknown += $proc.ProcessId
+        }
+    }
+
+    return [PSCustomObject]@{ InUsePaths = $inUse; UnknownOwnerPids = $unknown }
 }
 
 # ── Helper: delete stale files under a cache folder ───────────────────────────
@@ -287,6 +372,8 @@ Write-Log "MaxAgeDays     : $MaxAgeDays"
 Write-Log "ReportOnly     : $ReportOnly"
 $thresholdLabel = if ($thresholdEnabled) { "${MinSpaceToFreeGB}GB" } else { 'disabled' }
 Write-Log "MinSpaceToFree : $thresholdLabel"
+$guardLabel = if ($SkipProfilesWithRevitRunning) { "on ($($RevitProcessNames -join ', '))" } else { 'off' }
+Write-Log "RevitGuard     : $guardLabel"
 if ($ReportOnly) { Write-Log "*** REPORT ONLY MODE - no files will be deleted ***" -Level WARN }
 
 try {
@@ -317,6 +404,55 @@ try {
         $exitCode = $EXIT_SUCCESS
     } else {
         Write-Log "Found $($cacheTargets.Count) Collaboration Cache folder(s) across user profiles."
+
+        # ── Revit-running guard ────────────────────────────────────────────────
+        # Runs before the measure pass on purpose: the reclaimable total must cover
+        # only profiles that will actually be cleaned, or the gate could open on
+        # space this run is never going to reclaim.
+        if ($SkipProfilesWithRevitRunning) {
+            if (-not $RevitProcessNames -or $RevitProcessNames.Count -eq 0) {
+                Write-Log "RevitGuard is enabled but no process names are configured - it cannot match anything." -Level WARN
+            }
+
+            $inUse = Get-RevitInUseProfile -ProcessNames $RevitProcessNames
+            $ownerUnknownPids = @($inUse.UnknownOwnerPids)
+
+            if ($ownerUnknownPids.Count -gt 0) {
+                $pidList = $ownerUnknownPids -join ', '
+                if ($ReportOnly) {
+                    # Nothing is being deleted, so there is no safety issue. Finish the
+                    # scan and note that a real run would refuse - report mode never alarms.
+                    Write-Log "Revit is running (PID(s) $pidList) but the owner could not be determined. A live run would refuse to delete anything." -Level WARN
+                } else {
+                    Write-Log "Revit is running (PID(s) $pidList) but the owner could not be determined - no profile can be proven safe, so nothing was deleted." -Level ERROR
+                    $exitCode = $EXIT_OWNER_UNKNOWN
+                    return
+                }
+            }
+
+            if ($inUse.InUsePaths.Count -gt 0) {
+                $keep = @()
+                foreach ($target in $cacheTargets) {
+                    if ($inUse.InUsePaths.Contains($target.ProfilePath.TrimEnd('\'))) {
+                        if ($target.ProfileName -notin $skippedProfiles) {
+                            $skippedProfiles += $target.ProfileName
+                            Write-Log "[$($target.ProfileName)] SKIPPED: Revit is running for this user." -Level WARN
+                        }
+                    } else {
+                        $keep += $target
+                    }
+                }
+                $cacheTargets = @($keep)
+            }
+        }
+
+        if ($cacheTargets.Count -eq 0) {
+            # Distinct from "no cache found": caches exist, every one is in use.
+            $allTargetsSkipped = $true
+        }
+    }
+
+    if (-not $noCacheTargets -and -not $allTargetsSkipped) {
 
         # Measure pass - required when reporting (it IS the run) or to evaluate the
         # gate. Skipped entirely when the gate is off and we are deleting, so the
@@ -365,8 +501,17 @@ try {
         Write-Log "Summary: No Revit Collaboration Cache folders present - nothing to do."
         $exitCode = $EXIT_SUCCESS
 
+    } elseif ($allTargetsSkipped) {
+        # Distinct from "no cache found": caches exist, but Revit is running for every
+        # profile that has one.
+        Write-Log "Summary: Folders=0 | Skipped=$($skippedProfiles.Count) | Deleted=0"
+        Write-Log "Every profile with a cache has Revit running - nothing was cleaned." -Level WARN
+        $exitCode = $EXIT_SUCCESS
+
     } elseif ($skippedBelowThreshold) {
-        Write-Log "Summary: Folders=$foldersProcessed | Reclaimable=${reclaimableMB}MB | Threshold=${MinSpaceToFreeGB}GB | Deleted=0"
+        $gateSummary = "Summary: Folders=$foldersProcessed | Reclaimable=${reclaimableMB}MB | Threshold=${MinSpaceToFreeGB}GB | Deleted=0"
+        if ($skippedProfiles.Count -gt 0) { $gateSummary += " | Skipped=$($skippedProfiles.Count)" }
+        Write-Log $gateSummary
         Write-Log "Reclaimable ${reclaimableMB}MB is below the ${MinSpaceToFreeGB}GB threshold - skipping deletion." -Level WARN
         $exitCode = $EXIT_BELOW_THRESHOLD
 
@@ -374,6 +519,7 @@ try {
         $freedLabel = if ($ReportOnly) { 'Reclaimable' } else { 'Freed' }
         $summary = "Summary: Folders=$foldersProcessed | Files=$filesAffected | ${freedLabel}=${freedMB}MB | Failed=$failed"
         if ($thresholdEnabled) { $summary += " | Threshold=${MinSpaceToFreeGB}GB" }
+        if ($skippedProfiles.Count -gt 0) { $summary += " | Skipped=$($skippedProfiles.Count)" }
         Write-Log $summary
 
         # In report mode nothing is deleted, so no deletion can fail - always exit 0,
@@ -402,6 +548,15 @@ try {
         }
     }
 
+    # Exit precedence: 6 > 1 > 3 > 5 > 4 > 0. Skipping outranks the gate decision -
+    # "we did not examine everything" is more actionable than "what we examined was
+    # not worth cleaning" - but real deletion failures (1/3) outrank both. Report mode
+    # is excluded so a scan never alarms.
+    if (-not $ReportOnly -and $skippedProfiles.Count -gt 0 -and
+        $exitCode -notin @($EXIT_FAILURE, $EXIT_PARTIAL)) {
+        $exitCode = $EXIT_SKIPPED
+    }
+
     # With the gate off there is nothing to fail, so the threshold counts as met.
     $thresholdMet = if (-not $thresholdEnabled)        { $true }
                     elseif ($null -ne $reclaimableBytes) { $reclaimableBytes -ge $thresholdBytes }
@@ -425,6 +580,10 @@ try {
         ReclaimableGB         = $reclaimableGB
         ThresholdMet          = $thresholdMet
         SkippedBelowThreshold = $skippedBelowThreshold
+        GuardEnabled          = [bool]$SkipProfilesWithRevitRunning
+        SkippedProfiles       = $skippedProfiles
+        SkippedProfileCount   = $skippedProfiles.Count
+        OwnerUnknownPids      = $ownerUnknownPids
     }
 
 } catch {

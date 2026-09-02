@@ -1,5 +1,56 @@
 # Changelog — Clear-RevitCache.ps1
 
+## 2026-09-02
+
+Added a **per-user Revit-running guard**, closing the residual risk recorded as declined
+in the 2026-09-01 hardening entry. The `LastWriteTime` filter can select cache files
+belonging to a model that is open right now, so deleting them risks corruption or lost
+unsynced work — not merely a slow re-download.
+
+- New `$SkipProfilesWithRevitRunning` (default `$true`) and `$RevitProcessNames` (default
+  `@('Revit.exe')`) configuration variables.
+- The guard is **per-profile**: only profiles whose user owns a running Revit process are
+  skipped; every other profile on the workstation is still cleaned.
+- Profiles are matched by **SID → `Win32_UserProfile.LocalPath`**, not by username. A
+  profile folder is not reliably named after its user — duplicates become `user.DOMAIN`
+  or `user.000`. Verified against the Azure-AD SID format (`S-1-12-1-…`) as well as
+  classic SIDs. Attribution relies on the elevation the script already requires.
+- New exit code `5` when profiles were skipped, and `6` when a Revit process is running
+  whose owner cannot be determined — in that case no profile can be proven safe, so
+  nothing is deleted. `6` is deliberately distinct from `5` so a guard malfunction (which
+  could silently persist and leave a machine never cleaned) is distinguishable from the
+  routine case of someone simply having Revit open.
+- Documented exit-code precedence: `6` > `1` > `3` > `5` > `4` > `0`. Skips outrank the
+  threshold gate — "we did not examine everything" is more actionable than "what we
+  examined was not worth cleaning" — but genuine deletion failures outrank both.
+- **The guard runs before the measure pass**, so the reclaimable total covers only
+  profiles that will actually be cleaned. Otherwise the `$MinSpaceToFreeGB` gate could
+  open on space the run was never going to reclaim.
+- Report mode is unchanged in spirit: it reports what it *would* skip and still always
+  exits `0`. An unattributable process there logs a warning that a live run would refuse,
+  rather than aborting the scan — nothing is being deleted, so there is no safety issue.
+- `Get-RevitInUseProfile` deliberately does no logging. `Write-Log` INFO writes to the
+  success stream, so a function that logs cannot cleanly return an object — the same
+  trap that previously bit `Invoke-CachePass`. The caller does all logging.
+- `Get-RevitCollaborationCachePath` now also returns `ProfilePath`, needed for SID
+  matching.
+- Summary line gains `Skipped=<n>`; the summary object gains `GuardEnabled`,
+  `SkippedProfiles`, `SkippedProfileCount` and `OwnerUnknownPids`.
+- Exit codes and the two new variables are documented in `.NOTES`.
+
+**Fixed while re-verifying under elevation: comment-based help was never reachable.**
+`Get-Help .\Clear-RevitCache.ps1` returned only a bare syntax line. In Windows PowerShell
+5.1, *any* non-blank line abutting the `<#` help block — a `#Requires` statement or even a
+plain comment — suppresses the whole block. Inserting one blank line between the
+`#Requires` lines and `<#` restores it (43 → 3117 characters of help). This had been
+broken since the file was created and was masked by the test harness, which stripped the
+`#Requires` lines before running; the harness now leaves them intact.
+
+The same pattern affects
+[Invoke-DiskCleanup.ps1](../Invoke-DiskCleanup/Invoke-DiskCleanup.ps1), whose
+`#Requires -Version 5.1` also abuts its help block — not changed here, as it was outside
+this task.
+
 ## 2026-09-01 (audit)
 
 Full read-through after several rounds of feature work. Three real defects, each with a
@@ -75,9 +126,8 @@ Changes:
 - `Write-Log` no longer lets a locked or unwritable log derail a run; the failure is
   visible under `-Debug`.
 
-**Considered and declined:** a guard refusing to delete while Revit is running. The
-`LastWriteTime` filter can select files belonging to a live workshared session, so this
-remains the largest residual risk — reopen deliberately if that changes.
+**Considered and declined at the time:** a guard refusing to delete while Revit is
+running. Subsequently implemented — see the 2026-09-02 entry.
 
 ## 2026-09-01 (later)
 
