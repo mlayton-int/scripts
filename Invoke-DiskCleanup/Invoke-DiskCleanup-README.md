@@ -50,7 +50,7 @@ These are deliberate refusals, documented so nobody "fixes" them later:
 
 ### 3.1 Initialisation
 
-1. **Log rotation.** `C:\ProgramData\Kaseya\Logs\DiskCleanup.log` is rotated if it exceeds 5 MB;
+1. **Log rotation.** `C:\INS-Temp\Logs\DiskCleanup.log` is rotated if it exceeds 5 MB;
    the five most recent archives are retained, older ones deleted.
 2. **Process priority** is dropped to `BelowNormal` so the run doesn't compete with the user's
    foreground work.
@@ -173,7 +173,7 @@ count because other processes are writing to disk concurrently.
 
 ### 3.6 Reporting and exit
 
-The script writes a JSON summary to `C:\ProgramData\Kaseya\Logs\DiskCleanup_Summary.json`
+The script writes a JSON summary to `C:\INS-Temp\Logs\DiskCleanup_Summary.json`
 (machine details, before/after free space, per-task results), logs the final totals, and emits a
 single result string capped at 480 characters:
 
@@ -181,7 +181,7 @@ single result string capped at 480 characters:
   (those appear in the log and JSON). **Exit code 0.**
 - `FAILURE: <exception>` — an unhandled error outside any task wrapper. **Exit code 1.**
 
-The result string is written to `C:\ProgramData\Kaseya\ScriptResult_DiskCleanup.txt` and to stdout.
+The result string is written to `C:\INS-Temp\Logs\ScriptResult_DiskCleanup.txt` and to stdout.
 
 ---
 
@@ -270,7 +270,7 @@ FAILURE: Cannot find drive. A drive with the name 'C' does not exist.
 
 ### 5.2 Log file excerpt
 
-`C:\ProgramData\Kaseya\Logs\DiskCleanup.log`
+`C:\INS-Temp\Logs\DiskCleanup.log`
 
 ```
 [2026-08-20 02:14:03][INFO] === DiskCleanup v1.0 START ===
@@ -318,7 +318,7 @@ A rejected path looks like this — worth grepping for after any edit to the tas
 
 ### 5.3 JSON summary
 
-`C:\ProgramData\Kaseya\Logs\DiskCleanup_Summary.json` (abridged)
+`C:\INS-Temp\Logs\DiskCleanup_Summary.json` (abridged)
 
 ```json
 {
@@ -369,8 +369,8 @@ that were in use and left alone — that's the safety model working, not an erro
    (e.g. script 45, procedure 55). The script's own deadline should always fire first — that way you
    get a summary and a result string instead of a killed process.
 6. **Capture the result** with a *Get Variable* step reading
-   `C:\ProgramData\Kaseya\ScriptResult_DiskCleanup.txt`, or branch on the exit code (0 / 1).
-7. **Optionally collect** `C:\ProgramData\Kaseya\Logs\DiskCleanup_Summary.json` for fleet reporting.
+   `C:\INS-Temp\Logs\ScriptResult_DiskCleanup.txt`, or branch on the exit code (0 / 1).
+7. **Optionally collect** `C:\INS-Temp\Logs\DiskCleanup_Summary.json` for fleet reporting.
 
 ### 6.2 Scheduling
 
@@ -408,7 +408,7 @@ confirm the expanded command in the agent procedure log before rolling out.
 | `ComponentCleanup` reports `TIMEOUT` | Large component store or slow disk | Raise `-ComponentCleanupTimeoutMin`, or run it in a dedicated window. Safe to rerun; DISM resumes. |
 | `StaleProfiles` finds candidates but removes none | Profile still registered as loaded, or CIM removal denied | Check the per-profile WARN lines. Confirm the user is genuinely signed out. |
 | Script exits instantly, `SUCCESS: Skipped` | `-RunOnlyIfFreeSpaceBelowGB` threshold not met | Working as designed. Lower the threshold or drop the parameter for a forced run. |
-| Nothing in the log at all | Script never started, or `C:\ProgramData\Kaseya\Logs` not writable | Check the VSA procedure log and the agent's own error output. |
+| Nothing in the log at all | Script never started, or `C:\INS-Temp\Logs` not writable | Check the VSA procedure log and the agent's own error output. |
 
 **Rollback:** there is none, by design — deleted files are gone. This is why `-ReportOnly` exists and
 why the destructive tasks are opt-in. Recovery for anything genuinely lost is via your backup product.

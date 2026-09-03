@@ -28,9 +28,9 @@
     Self-contained by design: no shared library, so it can be deployed to VSA on its own.
 
     Outputs
-      C:\ProgramData\Kaseya\Logs\DiskCleanup_StaleProfiles.log
-      C:\ProgramData\Kaseya\Logs\DiskCleanup_StaleProfiles_Summary.json
-      C:\ProgramData\Kaseya\ScriptResult_DiskCleanup_StaleProfiles.txt
+      C:\INS-Temp\Logs\DiskCleanup_StaleProfiles.log
+      C:\INS-Temp\Logs\DiskCleanup_StaleProfiles_Summary.json
+      C:\INS-Temp\Logs\ScriptResult_DiskCleanup_StaleProfiles.txt
 
 .NOTES
     Author  : Michael Layton (Assisted by Claude.ai | Static analysis and testing completed manually)
@@ -65,7 +65,7 @@ $ErrorActionPreference = 'Stop'
 # ── Constants ──────────────────────────────────────────────────────────────────
 $ScriptName    = 'DiskCleanup_StaleProfiles'
 $ScriptVersion = '1.0.0'
-$LogDir        = 'C:\ProgramData\Kaseya\Logs'
+$LogDir        = 'C:\INS-Temp\Logs'
 $LogPath       = "$LogDir\$ScriptName.log"
 $SummaryPath   = "$LogDir\${ScriptName}_Summary.json"
 $SystemDrive   = $env:SystemDrive
@@ -109,7 +109,7 @@ function Write-Log {
 function Write-VSAResult {
     param([string]$Result)
     if ($Result.Length -gt 480) { $Result = $Result.Substring(0,477) + '...' }
-    try { $Result | Out-File -FilePath "C:\ProgramData\Kaseya\ScriptResult_$ScriptName.txt" -Encoding UTF8 -Force } catch { }
+    try { $Result | Out-File -FilePath "$LogDir\ScriptResult_$ScriptName.txt" -Encoding UTF8 -Force } catch { }
     Write-Output $Result
 }
 

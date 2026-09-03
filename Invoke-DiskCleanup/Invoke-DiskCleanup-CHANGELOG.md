@@ -1,5 +1,32 @@
 # Changelog — Invoke-DiskCleanup.ps1
 
+## 2026-09-03
+
+### Output directory moved to C:\INS-Temp\Logs\
+
+**Breaking change** for any already-deployed VSA procedure that reads the old paths.
+
+All 7 scripts (the main script and all 6 `Tasks\*.ps1` scripts) now write their log,
+JSON summary, and VSA result `.txt` to `C:\INS-Temp\Logs\` instead of split across
+`C:\ProgramData\Kaseya\Logs\` (log, summary) and `C:\ProgramData\Kaseya\` directly
+(result `.txt`, previously hardcoded rather than derived from `$LogDir`). All three
+outputs now live in one folder per script, matching the convention already used by
+`Clear-RevitCache.ps1`.
+
+- `$LogDir` changed from `C:\ProgramData\Kaseya\Logs` to `C:\INS-Temp\Logs` in every
+  script.
+- `Write-VSAResult`'s hardcoded `C:\ProgramData\Kaseya\ScriptResult_$ScriptName.txt` path
+  now derives from `$LogDir`, so it moves with everything else.
+- **Any VSA procedure with a *Get Variable* step reading the old
+  `C:\ProgramData\Kaseya\ScriptResult_*.txt` path must be repointed** at
+  `C:\INS-Temp\Logs\ScriptResult_*.txt` before this version is deployed, or result
+  capture will silently start reading a stale/missing file.
+- `C:\ProgramData\Kaseya` remains in `$script:ProtectedPaths` in the main script and in
+  `Tasks\Clear-TeamsCache.ps1` — unrelated to this script's own output, still a real
+  system folder worth protecting.
+- Updated the "Outputs" block in every script's comment-based help, plus all matching
+  paths in `Invoke-DiskCleanup-README.md` and `Tasks\_README.md`.
+
 ## 2026-09-02
 
 ### Fixed: the path safety gate was bypassable (and three siblings of the same bug)
