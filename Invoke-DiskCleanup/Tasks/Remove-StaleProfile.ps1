@@ -23,7 +23,7 @@
 
     WHAT THIS TRADES AWAY
       Everything in those profiles - documents, desktop, app data. There is no undo.
-      Run with -ReportOnly first and read the candidate list.
+      Run without -Delete first and read the candidate list.
 
     Self-contained by design: no shared library, so it can be deployed to VSA on its own.
 
@@ -47,8 +47,9 @@
 .PARAMETER MaxRuntimeMinutes
     Hard cap on total runtime. Default 45.
 
-.PARAMETER ReportOnly
-    List and measure candidates without removing anything.
+.PARAMETER Delete
+    Actually remove profiles. Omitted, the script lists and measures candidates and
+    removes nothing - report-only is the default. Read that list first.
 #>
 
 [CmdletBinding()]
@@ -56,8 +57,12 @@ param(
     [int]$ProfileAgeDays      = 120,
     [int]$MaxProfilesToRemove = 5,
     [int]$MaxRuntimeMinutes   = 45,
-    [switch]$ReportOnly
+    [switch]$Delete
 )
+
+# Report-only is the default; -Delete opts in to actually removing profiles. Everything
+# below reads $ReportOnly, so derive it once here rather than inverting at each use.
+$ReportOnly = -not $Delete
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'

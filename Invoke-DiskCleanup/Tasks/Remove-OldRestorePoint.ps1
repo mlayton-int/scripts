@@ -35,16 +35,21 @@
 .PARAMETER MaxRuntimeMinutes
     Hard cap on total runtime. Default 45.
 
-.PARAMETER ReportOnly
-    Count what would be removed without deleting anything.
+.PARAMETER Delete
+    Actually delete. Omitted, the script counts what would be removed and deletes
+    nothing - report-only is the default.
 #>
 
 [CmdletBinding()]
 param(
     [int]$KeepRestorePoints  = 1,
     [int]$MaxRuntimeMinutes  = 45,
-    [switch]$ReportOnly
+    [switch]$Delete
 )
+
+# Report-only is the default; -Delete opts in to actually removing anything. Everything
+# below reads $ReportOnly, so derive it once here rather than inverting at each use.
+$ReportOnly = -not $Delete
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'

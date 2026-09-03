@@ -45,8 +45,9 @@
 .PARAMETER ProtectedExtensions
     File extensions that are never deleted, wherever they are found.
 
-.PARAMETER ReportOnly
-    Measure reclaimable space without deleting anything.
+.PARAMETER Delete
+    Actually delete. Omitted, the script measures reclaimable space and deletes
+    nothing - report-only is the default.
 #>
 
 [CmdletBinding()]
@@ -54,8 +55,12 @@ param(
     [int]$MaxRuntimeMinutes        = 45,
     [string[]]$ProtectedExtensions = @('.pst','.ost','.nst','.edb','.vhd','.vhdx','.avhdx',
                                        '.vhdpmem','.kdbx','.pfx','.p12','.key','.psafe3','.bak'),
-    [switch]$ReportOnly
+    [switch]$Delete
 )
+
+# Report-only is the default; -Delete opts in to actually removing anything. Everything
+# below reads $ReportOnly, so derive it once here rather than inverting at each use.
+$ReportOnly = -not $Delete
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'

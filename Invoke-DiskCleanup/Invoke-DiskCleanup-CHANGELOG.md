@@ -1,5 +1,44 @@
 # Changelog — Invoke-DiskCleanup.ps1
 
+## 2026-09-03 (later)
+
+### Reporting is now the default; deleting requires -Delete
+
+**Breaking change.** `-ReportOnly` has been **replaced** by `[switch]$Delete` in the main
+script and all 6 `Tasks\*.ps1` scripts. Previously, running a script with no switch
+deleted; now it performs a full measurement pass and removes nothing.
+
+- **To reclaim space, pass `-Delete`.** Every existing VSA procedure that relied on the old
+  "no switch means delete" behaviour must add `-Delete`, or it will silently stop
+  reclaiming anything.
+- **`-ReportOnly` no longer exists** and will fail as an unknown parameter. Procedures
+  passing it should simply drop it — reporting is now what happens by default.
+- Internally each script still drives its logic from `$ReportOnly`, derived once as
+  `$ReportOnly = -not $Delete` immediately after `param()`. That keeps ~49 existing
+  internal reads untouched, so the behavioural diff is confined to argument handling. The
+  `ReportOnly` field in the JSON summary is unchanged.
+- `.PARAMETER` help updated in all 7 scripts, plus the README parameter table, the
+  suggested-profile examples, the deployment sections and the rollout guidance in both
+  READMEs.
+
+**Why a bare switch rather than defaulting `-ReportOnly` to `$true`.** That was the first
+attempt, and it worked, but it violated PowerShell convention and raised
+`PSAvoidDefaultValueSwitchParameter` on all 7 scripts — a switch that defaults to on
+inverts the meaning of a switch. It also depended on the caller writing
+`-ReportOnly:$false`, an explicit boolean that binds only when the script is invoked
+directly in a PowerShell session (which is how VSA X runs these). Under
+`powershell.exe -File script.ps1 -ReportOnly:$false` every argument arrives as plain text
+and PowerShell 5.1 rejects it with `ParameterArgumentTransformationError` — verified, and it
+fails identically as `-ReportOnly:0`, `-ReportOnly false`, and with a `[bool]`-typed
+parameter. Opting into the destructive action with a plain switch is the idiomatic fix:
+no analyser finding, and it binds under any invocation style.
+
+**Deployment sections corrected in both READMEs.** They previously documented
+`powershell.exe -ExecutionPolicy Bypass -NoProfile -File "<path>\Script.ps1" ...`, which is
+not how VSA X runs these — it invokes them directly inside an existing PowerShell session.
+Both now show direct invocation, and the `Tasks\` note claiming "there is no
+`-Switch:$true`" has been rewritten.
+
 ## 2026-09-03
 
 ### Output directory moved to C:\INS-Temp\Logs\

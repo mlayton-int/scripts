@@ -21,7 +21,8 @@ points) lives in **separate opt-in scripts** under [`Tasks\`](Tasks/README.md), 
 approved as its own procedure.
 
 It never kills a process, never shows a UI, never reboots, and never forces a locked file open.
-A `-ReportOnly` mode performs the full measurement pass and deletes nothing.
+It reports by default: without `-Delete` it performs the full measurement pass and removes
+nothing.
 
 **Typical yield:** 2–15 GB on a neglected workstation with this script's safe tasks. Machines with
 `Windows.old` present or a bloated component store can yield considerably more via the
@@ -103,7 +104,7 @@ Deletion is per-file inside a `try/catch`. **Locked, in-use, or ACL-denied files
 skipped and left in place** — there is no handle-closing, no `takeown` on general content, no retry
 loop. Directories that end up empty are pruned deepest-first; the task's root folder is never removed.
 
-Under `-ReportOnly`, the engine performs the identical walk and filter logic but records sizes
+Without `-Delete`, the engine performs the identical walk and filter logic but records sizes
 instead of deleting, so the report reflects exactly what a live run would remove.
 
 ### 3.4 Task isolation
@@ -203,7 +204,7 @@ Age gates for the opt-in tasks are parameters of their own scripts — see
 
 | Parameter | Default | Description |
 |---|---|---|
-| `-ReportOnly` | off | Full measurement pass, no deletions. |
+| `-Delete` | off | Actually delete. Omit it for a full measurement pass with no deletions. |
 | `-RunOnlyIfFreeSpaceBelowGB` | `0` | Exit 0 immediately if free space already exceeds this. `0` = always run. |
 | `-StopWhenFreeSpaceGB` | `0` | Stop starting new tasks once free space reaches this. `0` = run everything. |
 | `-MaxRuntimeMinutes` | `45` | Hard runtime cap. Set below your VSA procedure timeout. |
@@ -217,19 +218,23 @@ Not parameters of this script. Each is a separate procedure — see
 
 ### Suggested profiles
 
+Reporting is the default. Every line below that is meant to actually reclaim space passes
+`-Delete`.
+
 ```powershell
-# Pilot / audit — deletes nothing
-.\Invoke-DiskCleanup.ps1 -ReportOnly
+# Pilot / audit — deletes nothing (the default)
+.\Invoke-DiskCleanup.ps1
 
 # Fleet-wide scheduled maintenance (safe defaults, no-ops on healthy machines)
-.\Invoke-DiskCleanup.ps1 -RunOnlyIfFreeSpaceBelowGB 20 -MaxRuntimeMinutes 30
+.\Invoke-DiskCleanup.ps1 -RunOnlyIfFreeSpaceBelowGB 20 -MaxRuntimeMinutes 30 -Delete
 
 # Targeted remediation for a low-disk alert
-.\Invoke-DiskCleanup.ps1 -StopWhenFreeSpaceGB 25
+.\Invoke-DiskCleanup.ps1 -StopWhenFreeSpaceGB 25 -Delete
 
-# Then, if that was not enough, the opt-in tasks as their own procedures:
-.\Tasks\Remove-WindowsOld.ps1 -ReportOnly
-.\Tasks\Clear-AgedRecycleBin.ps1 -ReportOnly
+# Then, if that was not enough, the opt-in tasks as their own procedures.
+# Audit first, then run for real:
+.\Tasks\Remove-WindowsOld.ps1
+.\Tasks\Remove-WindowsOld.ps1 -Delete
 ```
 
 ---
@@ -358,13 +363,25 @@ that were in use and left alone — that's the safety model working, not an erro
 2. **Create an automation task** targeting Windows workstations.
 3. **Execution context:** SYSTEM. The script will run under a user account but will silently miss
    other profiles and most system paths — check the `Running as:` log line if results look thin.
-4. **Command:**
+4. **Command.** VSA X runs the script directly inside an existing PowerShell session, so
+   invoke it by path — there is no need to shell out to `powershell.exe`:
 
-   ```
-   powershell.exe -ExecutionPolicy Bypass -NoProfile -NonInteractive -File "<path>\Invoke-DiskCleanup.ps1" -RunOnlyIfFreeSpaceBelowGB 20
+   ```powershell
+   # Audit — reporting is the default
+   .\Invoke-DiskCleanup.ps1 -RunOnlyIfFreeSpaceBelowGB 20
+
+   # Actually reclaim space
+   .\Invoke-DiskCleanup.ps1 -RunOnlyIfFreeSpaceBelowGB 20 -Delete
    ```
 
-   Do not set the execution policy inside the script; VSA supplies `-ExecutionPolicy Bypass`.
+   Do not set the execution policy inside the script; VSA handles it.
+
+   `-Delete` is a plain switch, so it binds the same way under any invocation style. That
+   is deliberate: an earlier design used `-ReportOnly:$false` to opt into deleting, which
+   works when the script is invoked directly but fails under
+   `powershell.exe -File script.ps1 -ReportOnly:$false` — there every argument arrives as
+   plain text and PowerShell 5.1 rejects it with `ParameterArgumentTransformationError`.
+   A bare switch has no such trap.
 5. **Timeout:** set the procedure timeout above `-MaxRuntimeMinutes` plus a few minutes of headroom
    (e.g. script 45, procedure 55). The script's own deadline should always fire first — that way you
    get a summary and a result string instead of a killed process.
@@ -410,8 +427,9 @@ confirm the expanded command in the agent procedure log before rolling out.
 | Script exits instantly, `SUCCESS: Skipped` | `-RunOnlyIfFreeSpaceBelowGB` threshold not met | Working as designed. Lower the threshold or drop the parameter for a forced run. |
 | Nothing in the log at all | Script never started, or `C:\INS-Temp\Logs` not writable | Check the VSA procedure log and the agent's own error output. |
 
-**Rollback:** there is none, by design — deleted files are gone. This is why `-ReportOnly` exists and
-why the destructive tasks are opt-in. Recovery for anything genuinely lost is via your backup product.
+**Rollback:** there is none, by design — deleted files are gone. This is why `-Delete` must be
+opted into and why the destructive tasks are separate scripts. Recovery for anything genuinely lost
+is via your backup product.
 
 ---
 
@@ -419,7 +437,7 @@ why the destructive tasks are opt-in. Recovery for anything genuinely lost is vi
 
 ### Phase 1 — Audit (recommended: 1 week, 10–20 machines)
 
-Run with `-ReportOnly` across a representative sample: a heavy browser user, a developer machine, a
+Run without `-Delete` across a representative sample: a heavy browser user, a developer machine, a
 shared/kiosk workstation, a laptop that's been through a feature update, and a machine currently
 low on disk. Collect the JSON summaries.
 

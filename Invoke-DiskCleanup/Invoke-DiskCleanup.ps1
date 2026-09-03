@@ -24,7 +24,8 @@
       - Locked/in-use files fail closed: they are counted as skipped, never force-unlocked.
       - Nothing is killed, no user prompt, no GUI (cleanmgr is deliberately NOT used), no reboot.
       - Process runs at BelowNormal priority with a hard runtime cap.
-      - -ReportOnly performs a full measurement pass and deletes nothing.
+      - Reports by default. Without -Delete it performs a full measurement pass and
+        deletes nothing.
 
     DELIBERATELY NOT TOUCHED (documented refusals, not oversights)
       - C:\Windows\Installer          - orphaned patch cleanup breaks repair/uninstall of apps.
@@ -63,8 +64,9 @@
     MemoryDumps, WindowsLogs, DownloadedProgramFiles, DeliveryOptimization, WindowsUpdateCache,
     ThumbnailCache, BrowserCache.
 
-.PARAMETER ReportOnly
-    Measure and report reclaimable space without deleting anything.
+.PARAMETER Delete
+    Actually delete. Omitted, the script performs a full measurement pass and reports
+    reclaimable space without removing anything - report-only is the default.
 #>
 
 [CmdletBinding()]
@@ -79,11 +81,15 @@ param(
     [int]$MaxRuntimeMinutes            = 45,
 
     [string[]]$SkipTasks               = @(),
-    [switch]$ReportOnly,
+    [switch]$Delete,
 
     [string[]]$ProtectedExtensions     = @('.pst','.ost','.nst','.edb','.vhd','.vhdx','.avhdx',
                                            '.vhdpmem','.kdbx','.pfx','.p12','.key','.psafe3','.bak')
 )
+
+# Report-only is the default; -Delete opts in to actually removing anything. Everything
+# below reads $ReportOnly, so derive it once here rather than inverting at each use.
+$ReportOnly = -not $Delete
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -333,7 +339,7 @@ function Test-SafeCleanupPath {
 function Clear-PathAgedFiles {
     <#
         Walks $Path manually (never following reparse points), deletes files whose LastWriteTime
-        is older than $OlderThanDays, and reports bytes/items. Honors -ReportOnly and the deadline.
+        is older than $OlderThanDays, and reports bytes/items. Honors $ReportOnly and the deadline.
     #>
     param(
         [Parameter(Mandatory)][string]$Path,

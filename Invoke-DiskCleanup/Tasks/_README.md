@@ -24,8 +24,8 @@ code has to be applied to each.
 | `Remove-StaleProfile.ps1` | `StaleProfiles` | Everything in the removed profiles. No undo. |
 | `Remove-OldRestorePoint.ps1` | `RestorePoints` | System Restore points and Previous Versions. |
 
-Every script accepts `-ReportOnly` and `-MaxRuntimeMinutes` (default 45) in addition to its
-own parameters below.
+Every script accepts `-Delete` (omit it to report only — that is the default) and
+`-MaxRuntimeMinutes` (default 45) in addition to its own parameters below.
 
 `Clear-AgedRecycleBin` is named to avoid colliding with PowerShell 5.1's built-in
 `Clear-RecycleBin` cmdlet, which cannot reach other users' bins from SYSTEM.
@@ -58,7 +58,7 @@ own parameters below.
 - **`ComponentCleanup`** runs DISM at `BelowNormal` priority with its own timeout. On
   timeout the process is terminated and the task reports `TIMEOUT`; DISM's transaction
   handling means a killed run is resumable. Exit codes 0 and 3010 are success. Skipped if a
-  servicing operation is already in flight. **Not measurable under `-ReportOnly`** — it
+  servicing operation is already in flight. **Not measurable without `-Delete`** — it
   reports `SKIPPED` there. `/ResetBase` is deliberately never used, as it permanently blocks
   uninstalling installed updates.
 - **`StaleProfiles`** requires the profile to be non-Special, **not loaded**, under
@@ -106,10 +106,16 @@ are logged). `1` = fatal error; the result file starts with `FAILURE:`.
 
 ## 5. VSA X deployment
 
-One procedure per task. Upload the single `.ps1`, run it as SYSTEM:
+One procedure per task. Upload the single `.ps1`, run it as SYSTEM. VSA X runs the script
+directly inside an existing PowerShell session, so invoke it by path — no need to shell out
+to `powershell.exe`:
 
-```
-powershell.exe -ExecutionPolicy Bypass -NoProfile -NonInteractive -File "<path>\Clear-AgedRecycleBin.ps1" -RecycleBinAgeDays 30
+```powershell
+# Audit — reporting is the default
+.\Clear-AgedRecycleBin.ps1 -RecycleBinAgeDays 30
+
+# Actually delete
+.\Clear-AgedRecycleBin.ps1 -RecycleBinAgeDays 30 -Delete
 ```
 
 Capture the result with a *Get Variable* step reading
@@ -120,15 +126,19 @@ For `Invoke-ComponentCleanup`, set the procedure timeout above
 `-ComponentCleanupTimeoutMin` plus headroom (e.g. script 30, procedure 40) so the script's
 own timeout fires first and you still get a summary.
 
-Switches are passed by including or omitting the switch text; there is no `-Switch:$true`.
+Switches are passed simply by including or omitting the switch text — including `-Delete`.
+That is why deleting is opted into with a bare switch rather than something like
+`-ReportOnly:$false`: an explicit boolean binds when the script is invoked directly, but
+fails under `powershell.exe -File`, where arguments arrive as plain text and PowerShell 5.1
+cannot coerce them to a boolean. A bare switch works under either invocation style.
 
 ### Suggested scheduling
 
 - **On low-disk alert:** `Remove-WindowsOld` then `Clear-AgedRecycleBin` — the best
   space-per-risk ratio.
 - **Quarterly / change window:** `Invoke-ComponentCleanup` and `Remove-OldRestorePoint`.
-- **Rarely, deliberately:** `Remove-StaleProfile`. Read a `-ReportOnly` candidate list
-  first, every time.
+- **Rarely, deliberately:** `Remove-StaleProfile`. Read the candidate list from a run
+  without `-Delete` first, every time.
 - **`Clear-TeamsCache`** is low risk and can run on a normal maintenance cadence, though it
   only yields anything when Teams is closed.
 
@@ -136,7 +146,7 @@ Switches are passed by including or omitting the switch text; there is no `-Swit
 
 ## 6. Rollout
 
-Run each with `-ReportOnly` first and read the log. `Invoke-ComponentCleanup` is the
+Run each without `-Delete` first and read the log. `Invoke-ComponentCleanup` is the
 exception — it cannot measure in advance, so pilot it on a single machine instead.
 
 Introduce them one at a time, in ascending order of risk:
@@ -148,6 +158,6 @@ Introduce them one at a time, in ascending order of risk:
 tickets. Both are age-gated and `Remove-StaleProfile` is capped per run, but the age gate is
 the only thing standing between a user and a lost file they expected to still be in the bin.
 
-**Rollback:** there is none, by design — deleted files are gone. This is why `-ReportOnly`
-exists and why these tasks are separate, individually approved procedures. Recovery for
+**Rollback:** there is none, by design — deleted files are gone. This is why `-Delete` must be
+opted into and why these tasks are separate, individually approved procedures. Recovery for
 anything genuinely lost is via your backup product.

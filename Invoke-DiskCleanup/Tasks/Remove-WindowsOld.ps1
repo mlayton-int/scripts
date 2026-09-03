@@ -39,16 +39,21 @@
 .PARAMETER MaxRuntimeMinutes
     Hard cap on total runtime. Default 45.
 
-.PARAMETER ReportOnly
-    Measure what would be removed without deleting anything or changing ownership.
+.PARAMETER Delete
+    Actually delete. Omitted, the script measures what would be removed without
+    deleting anything or changing ownership - report-only is the default.
 #>
 
 [CmdletBinding()]
 param(
     [int]$WindowsOldAgeDays = 30,
     [int]$MaxRuntimeMinutes = 45,
-    [switch]$ReportOnly
+    [switch]$Delete
 )
+
+# Report-only is the default; -Delete opts in to actually removing anything. Everything
+# below reads $ReportOnly, so derive it once here rather than inverting at each use.
+$ReportOnly = -not $Delete
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'

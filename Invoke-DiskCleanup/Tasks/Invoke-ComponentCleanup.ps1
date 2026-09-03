@@ -17,7 +17,7 @@
 
     WHAT THIS TRADES AWAY
       Little in recovery terms, but it is CPU-heavy and long-running - schedule it in a
-      change window, not during business hours. Not measurable in -ReportOnly.
+      change window, not during business hours. Not measurable without -Delete.
 
     Self-contained by design: no shared library, so it can be deployed to VSA on its own.
 
@@ -41,16 +41,21 @@
 .PARAMETER MaxRuntimeMinutes
     Hard cap on total runtime. Default 45.
 
-.PARAMETER ReportOnly
-    Reports SKIPPED without running DISM - the reclaim is not measurable in advance.
+.PARAMETER Delete
+    Actually run DISM. Omitted, the task reports SKIPPED without running it - the
+    reclaim is not measurable in advance, so there is nothing to report either way.
 #>
 
 [CmdletBinding()]
 param(
     [int]$ComponentCleanupTimeoutMin = 30,
     [int]$MaxRuntimeMinutes          = 45,
-    [switch]$ReportOnly
+    [switch]$Delete
 )
+
+# Report-only is the default; -Delete opts in to actually running DISM. Everything
+# below reads $ReportOnly, so derive it once here rather than inverting at each use.
+$ReportOnly = -not $Delete
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'

@@ -7,7 +7,8 @@
     seams where the split could go wrong.
 
     WHAT IT CHECKS
-      - Each of the 6 task scripts runs to completion under -ReportOnly, exits 0, and
+      - Each of the 6 task scripts runs to completion without -Delete (report-only is the
+        default), exits 0, and
         writes all three of its outputs (.log, _Summary.json, ScriptResult_*.txt) into
         the configured $LogDir. This is what catches an output path drifting: the
         expected folder is read from each script's own $LogDir assignment rather than
@@ -25,7 +26,7 @@
         main script must fail as an unknown parameter.
 
     SAFETY
-      Every run is -ReportOnly, so nothing is deleted. ComponentCleanup does not invoke
+      -Delete is never passed, so nothing is deleted. ComponentCleanup does not invoke
       DISM in report mode and WindowsOld does not take ownership or delete - those two
       destructive paths are deliberately NOT exercised here and are verified by
       inspection instead.
@@ -95,7 +96,8 @@ try {
             if (-not (Test-Path -LiteralPath $f)) { Register-Created $f }
         }
 
-        $out   = Invoke-ScriptUnderTest -Path $s.File -Arguments @('-ReportOnly')
+        # No -Delete: reporting is the default, so this run removes nothing.
+        $out   = Invoke-ScriptUnderTest -Path $s.File
         $code  = Get-LastScriptExit
         $short = $s.Name
 
@@ -136,7 +138,7 @@ try {
     $allCore = @('WindowsTemp','UserTemp','UserInternetCache','WindowsErrorReporting','MemoryDumps',
                  'WindowsLogs','DownloadedProgramFiles','DeliveryOptimization','WindowsUpdateCache',
                  'ThumbnailCache','BrowserCache')
-    $null = Invoke-ScriptUnderTest -Path $MainScript -Arguments (@('-ReportOnly','-SkipTasks') + (,($allCore -join ',')))
+    $null = Invoke-ScriptUnderTest -Path $MainScript -Arguments (@('-SkipTasks') + (,($allCore -join ',')))
 
     Add-TestCheck 'rotation: task archive survived main rotation' $true (Test-Path -LiteralPath $taskArchive)
     $mainArchives = @(Get-ChildItem -LiteralPath $logDir -Filter 'DiskCleanup-*.log' -ErrorAction SilentlyContinue)
@@ -149,6 +151,47 @@ try {
         $out = Invoke-ScriptUnderTest -Path $MainScript -Arguments @($sw)
         Add-TestCheck "main rejects $sw" $true ([bool](($out | Out-String) -match [regex]::Escape($sw.TrimStart('-'))))
     }
+
+    # ══ Reporting is the default; -Delete opts into removing things ═══════════
+    # Deleting is opted into with the bare -Delete switch rather than by defaulting
+    # -ReportOnly to $true. Two reasons, both worth locking in:
+    #   1. A switch defaulting to $true inverts what a switch means, and PSScriptAnalyzer
+    #      flags it (PSAvoidDefaultValueSwitchParameter).
+    #   2. That design needed the caller to write -ReportOnly:$false, an explicit boolean
+    #      that binds only under direct invocation. Via
+    #      "powershell.exe -File script.ps1 -ReportOnly:$false" every argument arrives as
+    #      plain text and PowerShell 5.1 throws ParameterArgumentTransformationError.
+    #      A bare switch binds under either style.
+    #
+    # Each script derives $ReportOnly = -not $Delete just after param(), and the ~49
+    # internal reads still use $ReportOnly - so the probe is injected AFTER that
+    # derivation to exercise binding and derivation together. Injecting after param()
+    # alone would read $ReportOnly before it is assigned.
+    #
+    # Nothing destructive ever runs: the probe prints and exits before any real logic.
+    # These scripts delete production data (Recycle Bin, Teams cache, Windows.old, stale
+    # profiles), so -Delete is never executed live here.
+    $anchor = '$ReportOnly = -not $Delete'
+    $probeDir = New-TestWorkspace -Label 'delprobe'
+    try {
+        foreach ($s in $scripts) {
+            $name = Split-Path $s.File -Leaf
+            $raw  = Get-Content -LiteralPath $s.File -Raw
+            Add-TestCheck "$name : derives ReportOnly from Delete" $true ($raw.Contains($anchor))
+
+            $probe = Join-Path $probeDir $name
+            $raw.Replace($anchor, $anchor + "`nWrite-Output ('RESOLVED=' + [bool]`$ReportOnly)`nexit 0") |
+                Set-Content -LiteralPath $probe -Encoding utf8
+
+            Add-TestCheck "$name : no args -> report only"  'RESOLVED=True'  (& $probe)
+            Add-TestCheck "$name : -Delete -> deletes"      'RESOLVED=False' (& $probe -Delete)
+        }
+
+        # -ReportOnly is gone: passing it must fail rather than silently do nothing.
+        $out = Invoke-ScriptUnderTest -Path $MainScript -Arguments @('-ReportOnly')
+        Add-TestCheck 'main rejects removed -ReportOnly' $true ([bool](($out | Out-String) -match 'ReportOnly'))
+    }
+    finally { Remove-TestWorkspace -Path $probeDir }
 }
 finally {
     foreach ($f in $script:Created) {
