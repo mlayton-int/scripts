@@ -1,9 +1,12 @@
-﻿#Requires -Version 5.1
+﻿# Keep the blank line between #Requires and the <# help block below. In Windows
+# PowerShell 5.1 ANY non-blank line abutting the help block - a #Requires or even
+# a comment - suppresses it, and Get-Help returns only a bare syntax line.
+#Requires -Version 5.1
 
 <#
 .NOTES
     Author  : Michael Layton (Assisted by Claude.ai | Static analysis and testing completed manually)
-    Version : 1.0.2
+    Version : 2.0.0
     Context : SYSTEM  (required - the script enumerates all user profiles and system paths)
     Exit    : 0 = success (including partial task failures, which are logged), 1 = fatal error
 
@@ -32,13 +35,7 @@
       - Browser cookies, logins, history, bookmarks, profiles - cache subfolders only.
       - DISM /ResetBase               - blocks uninstalling updates; not offered.
 
-    OPT-IN (off by default, each one trades a recovery option for space)
-      -EmptyRecycleBin        Removes items deleted more than -RecycleBinAgeDays ago.
-      -CleanTeamsCache        May force a Teams re-login on some builds.
-      -RemoveWindowsOld       Removes OS rollback capability. Age-gated.
-      -RunComponentCleanup    DISM WinSxS cleanup. CPU-heavy, long-running, no /ResetBase.
-      -RemoveStaleProfiles    Deletes unloaded user profiles older than -ProfileAgeDays.
-      -RemoveOldRestorePoints Deletes all but the newest -KeepRestorePoints shadow copies.
+      See Tasks\README.md for parameters and deployment.
 
 .PARAMETER TempFileAgeDays
     Minimum age (days, last write time) for temp files to be removed. Default 2.
@@ -84,25 +81,6 @@ param(
     [string[]]$SkipTasks               = @(),
     [switch]$ReportOnly,
 
-    # ── Opt-in tasks ───────────────────────────────────────────────────────────
-    [switch]$EmptyRecycleBin,
-    [int]$RecycleBinAgeDays            = 30,
-
-    [switch]$CleanTeamsCache,
-
-    [switch]$RemoveWindowsOld,
-    [int]$WindowsOldAgeDays            = 30,
-
-    [switch]$RunComponentCleanup,
-    [int]$ComponentCleanupTimeoutMin   = 30,
-
-    [switch]$RemoveStaleProfiles,
-    [int]$ProfileAgeDays               = 120,
-    [int]$MaxProfilesToRemove          = 5,
-
-    [switch]$RemoveOldRestorePoints,
-    [int]$KeepRestorePoints            = 1,
-
     [string[]]$ProtectedExtensions     = @('.pst','.ost','.nst','.edb','.vhd','.vhdx','.avhdx',
                                            '.vhdpmem','.kdbx','.pfx','.p12','.key','.psafe3','.bak')
 )
@@ -121,6 +99,15 @@ $SystemDrive   = $env:SystemDrive                      # normally 'C:'
 $script:Deadline     = (Get-Date).AddMinutes($MaxRuntimeMinutes)
 $script:TaskResults  = New-Object System.Collections.Generic.List[object]
 $script:StopReason   = ''
+
+# Path-safety rejections recorded during a task. Clear-PathAgedFiles cannot log these
+# itself: Write-Log writes to the success stream, which would corrupt its return value.
+# Invoke-CleanupTask drains this list and logs it once the task has finished.
+$script:PathSkips    = New-Object System.Collections.Generic.List[string]
+
+# Count of files preserved because of $ProtectedExtensions, for the same reason:
+# Clear-PathAgedFiles cannot log them without corrupting its return value.
+$script:ProtectedSkips = 0
 
 # Paths that must never be handed to the deletion engine, even by mistake.
 $script:ProtectedPaths = @(
@@ -145,13 +132,21 @@ function Invoke-LogRotation {
     try {
         if (Test-Path -LiteralPath $LogFilePath) {
             if ((Get-Item -LiteralPath $LogFilePath).Length -gt $MaxSizeBytes) {
-                $archive = $LogFilePath -replace '\.log$', "_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+                # Archives use a '-' separator so the prune filter below cannot match a
+                # per-task log such as DiskCleanup_RecycleBin.log.
+                $archive = $LogFilePath -replace '\.log$', "-$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
                 Rename-Item -LiteralPath $LogFilePath -NewName (Split-Path $archive -Leaf) -Force
             }
         }
-        # Keep only the 5 most recent archives.
-        Get-ChildItem -LiteralPath (Split-Path $LogFilePath) -Filter "$ScriptName`_*.log" -ErrorAction SilentlyContinue |
-            Sort-Object LastWriteTime -Descending | Select-Object -Skip 5 |
+        # Keep only the 5 most recent archives. Both patterns anchor on the timestamp -
+        # the current '-<stamp>' form and the legacy '_20<stamp>' form - so sibling task
+        # logs are never candidates for deletion.
+        $dir = Split-Path $LogFilePath
+        $archives = @(
+            Get-ChildItem -LiteralPath $dir -Filter "$ScriptName-*.log"    -ErrorAction SilentlyContinue
+            Get-ChildItem -LiteralPath $dir -Filter "$ScriptName`_20*.log" -ErrorAction SilentlyContinue
+        )
+        $archives | Sort-Object LastWriteTime -Descending | Select-Object -Skip 5 |
             ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
     } catch { }
 }
@@ -226,13 +221,20 @@ function Test-TargetReached {
 }
 
 function Test-TaskEnabled {
-    param([string]$TaskName)
-    if ($SkipTasks -contains $TaskName) {
-        Write-Log "Task '$TaskName' skipped by -SkipTasks."
-        return $false
-    }
-    if (Test-Deadline)      { Write-Log "Task '$TaskName' skipped: $($script:StopReason)." -Level WARN; return $false }
-    if (Test-TargetReached) { Write-Log "Task '$TaskName' skipped: $($script:StopReason)."; return $false }
+    <#
+        Pure predicate - deliberately does NOT log. Write-Log writes to the success
+        stream, so a logging predicate returns @(log lines..., $false); "-not" on that
+        non-empty array is $false, which silently defeated every skip check. The caller
+        logs $Reason instead.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$TaskName,
+        [Parameter(Mandatory)][ref]$Reason
+    )
+    $Reason.Value = ''
+    if ($SkipTasks -contains $TaskName) { $Reason.Value = 'skipped by -SkipTasks';  return $false }
+    if (Test-Deadline)                  { $Reason.Value = $script:StopReason;       return $false }
+    if (Test-TargetReached)             { $Reason.Value = $script:StopReason;       return $false }
     return $true
 }
 
@@ -268,20 +270,31 @@ function Test-SafeCleanupPath {
         Returns $true only if the path is a real, non-reparse directory that is safe to clean.
         Blocks: drive roots, protected system folders, parents of protected folders,
                 anything under C:\Users that is not inside AppData.
-    #>
-    param([string]$Path)
 
-    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+        Pure predicate - deliberately does NOT log. Write-Log writes to the success
+        stream, so logging here returned @(log line, $false) to the caller, and
+        "-not" on that non-empty array evaluates to $false. That silently bypassed
+        this gate entirely, allowing deletion on paths it had just rejected. The
+        rejection reason travels back through -Reason instead.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][ref]$Reason
+    )
+
+    $Reason.Value = ''
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { $Reason.Value = 'empty path'; return $false }
 
     try   { $full = [System.IO.Path]::GetFullPath($Path).TrimEnd('\') }
-    catch { Write-Log "Path rejected (unparseable): $Path" -Level WARN; return $false }
+    catch { $Reason.Value = "unparseable: $Path"; return $false }
 
-    if ($full.Length -lt 4) { Write-Log "Path rejected (too shallow): $full" -Level WARN; return $false }
-    if ($full -match '^[A-Za-z]:$') { Write-Log "Path rejected (drive root): $full" -Level WARN; return $false }
+    if ($full.Length -lt 4)         { $Reason.Value = "too shallow: $full"; return $false }
+    if ($full -match '^[A-Za-z]:$') { $Reason.Value = "drive root: $full";  return $false }
 
     foreach ($p in $script:ProtectedPaths) {
         if ($full -ieq $p.TrimEnd('\')) {
-            Write-Log "Path rejected (protected): $full" -Level WARN; return $false
+            $Reason.Value = "protected: $full"; return $false
         }
     }
 
@@ -289,25 +302,29 @@ function Test-SafeCleanupPath {
     foreach ($p in $script:ProtectedPaths) {
         $prot = $p.TrimEnd('\')
         if ($prot.Length -gt $full.Length -and $prot.StartsWith("$full\", 'OrdinalIgnoreCase')) {
-            Write-Log "Path rejected (ancestor of protected path $prot): $full" -Level WARN; return $false
+            $Reason.Value = "ancestor of protected path ${prot}: $full"; return $false
         }
     }
 
     # Inside a user profile, only AppData is ever in scope.
     if ($full -imatch "^$([regex]::Escape("$SystemDrive\Users"))\\") {
         if ($full -inotmatch '\\AppData\\(Local|LocalLow|Roaming)(\\|$)') {
-            Write-Log "Path rejected (user profile data outside AppData): $full" -Level WARN; return $false
+            $Reason.Value = "user profile data outside AppData: $full"; return $false
         }
     }
 
-    if (-not (Test-Path -LiteralPath $full -PathType Container)) { return $false }
+    if (-not (Test-Path -LiteralPath $full -PathType Container)) {
+        $Reason.Value = "not a directory: $full"; return $false
+    }
 
     try {
         $item = Get-Item -LiteralPath $full -Force
         if (([System.IO.FileAttributes]::ReparsePoint -band $item.Attributes) -eq [System.IO.FileAttributes]::ReparsePoint) {
-            Write-Log "Path rejected (reparse point): $full" -Level WARN; return $false
+            $Reason.Value = "reparse point: $full"; return $false
         }
-    } catch { return $false }
+    } catch {
+        $Reason.Value = "unreadable: $full"; return $false
+    }
 
     return $true
 }
@@ -325,10 +342,25 @@ function Clear-PathAgedFiles {
         [switch]$RemoveEmptyDirs
     )
 
-    $result = [PSCustomObject]@{ Bytes = [double]0; Items = 0; Failed = 0; Skipped = $false }
+    $result = [PSCustomObject]@{
+        Bytes = [double]0; Items = 0; Failed = 0; Skipped = $false
+        SkipReason = ''; ProtectedSkipped = 0
+    }
 
-    if (-not (Test-Path -LiteralPath $Path)) { $result.Skipped = $true; return $result }
-    if (-not (Test-SafeCleanupPath -Path $Path)) { $result.Skipped = $true; return $result }
+    if (-not (Test-Path -LiteralPath $Path)) {
+        $result.Skipped = $true; $result.SkipReason = "path not present: $Path"
+        return $result
+    }
+
+    # This function must not log - it returns $result, and Write-Log writes to the
+    # success stream. Rejections go to $script:PathSkips, which Invoke-CleanupTask
+    # drains and logs after the task completes.
+    $why = ''
+    if (-not (Test-SafeCleanupPath -Path $Path -Reason ([ref]$why))) {
+        $result.Skipped = $true; $result.SkipReason = $why
+        $script:PathSkips.Add($why)
+        return $result
+    }
 
     $cutoff = (Get-Date).AddDays(-[math]::Abs($OlderThanDays))
     $stack  = New-Object System.Collections.Stack
@@ -356,7 +388,10 @@ function Clear-PathAgedFiles {
 
                 if ($entry.LastWriteTime -ge $cutoff) { continue }
                 if ($ProtectedExtensions -contains $entry.Extension.ToLower()) {
-                    Write-Log "Protected extension preserved: $($entry.FullName)"
+                    # Counted, not logged: logging here would corrupt $result.
+                    # Invoke-CleanupTask reports the total once the task finishes.
+                    $result.ProtectedSkipped++
+                    $script:ProtectedSkips++
                     continue
                 }
                 if (([System.IO.FileAttributes]::System -band $entry.Attributes) -eq [System.IO.FileAttributes]::System) { continue }
@@ -399,14 +434,23 @@ function Clear-PathAgedFiles {
 }
 
 function Get-UserProfilePath {
-    <# All non-special local user profiles. #>
+    <#
+        All non-special local user profiles.
+
+        Does not log - it returns a collection, and Write-Log output would be prepended
+        to it, so callers would treat log lines as profile paths. Any fallback reason
+        comes back through -FallbackReason.
+    #>
+    param([Parameter(Mandatory)][ref]$FallbackReason)
+
+    $FallbackReason.Value = ''
     $paths = New-Object System.Collections.Generic.List[string]
     try {
         Get-CimInstance -ClassName Win32_UserProfile -ErrorAction Stop |
             Where-Object { -not $_.Special -and $_.LocalPath -and (Test-Path -LiteralPath $_.LocalPath) } |
             ForEach-Object { $paths.Add($_.LocalPath) }
     } catch {
-        Write-Log "Win32_UserProfile enumeration failed, falling back to directory listing: $_" -Level WARN
+        $FallbackReason.Value = "$_"
         Get-ChildItem -LiteralPath "$SystemDrive\Users" -Directory -Force -ErrorAction SilentlyContinue |
             Where-Object { $_.Name -notin @('Public','Default','Default User','All Users') } |
             ForEach-Object { $paths.Add($_.FullName) }
@@ -415,15 +459,34 @@ function Get-UserProfilePath {
 }
 
 function Invoke-CleanupTask {
-    <# Isolates each task so one failure never aborts the run. #>
+    <#
+        Isolates each task so one failure never aborts the run. Returns nothing, which
+        is why it is safe for this function to log - it is where the skip reasons and
+        path rejections collected by the non-logging predicates get reported.
+    #>
     param([string]$Name, [scriptblock]$Action)
-    if (-not (Test-TaskEnabled -TaskName $Name)) { return }
+
+    $why = ''
+    if (-not (Test-TaskEnabled -TaskName $Name -Reason ([ref]$why))) {
+        Write-Log "Task '$Name' skipped: $why."
+        return
+    }
     try {
         Write-Log "--- Task start: $Name"
         & $Action
     } catch {
         Write-Log "Task '$Name' failed: $_" -Level WARN
         Add-TaskResult -Task $Name -Status 'FAILED' -Detail "$_"
+    } finally {
+        # Drain the diagnostics Clear-PathAgedFiles could not log itself.
+        while ($script:PathSkips.Count -gt 0) {
+            Write-Log "Path rejected ($($script:PathSkips[0]))" -Level WARN
+            $script:PathSkips.RemoveAt(0)
+        }
+        if ($script:ProtectedSkips -gt 0) {
+            Write-Log "Task '$Name': $($script:ProtectedSkips) file(s) preserved by protected-extension rule."
+            $script:ProtectedSkips = 0
+        }
     }
 }
 
@@ -450,7 +513,11 @@ try {
         exit 0
     }
 
-    $profilePaths = Get-UserProfilePath
+    $profileFallback = ''
+    $profilePaths = Get-UserProfilePath -FallbackReason ([ref]$profileFallback)
+    if ($profileFallback) {
+        Write-Log "Win32_UserProfile enumeration failed, used directory listing: $profileFallback" -Level WARN
+    }
     Write-Log "User profiles in scope: $($profilePaths.Count)"
 
     # ── 1. Windows temp ────────────────────────────────────────────────────────
@@ -714,187 +781,6 @@ try {
         $detail = 'Cache folders only - cookies, passwords, history and bookmarks untouched.'
         if ($skipped.Count -gt 0) { $detail += " Skipped (running): $($skipped -join ', ')." }
         Add-TaskResult -Task 'BrowserCache' -Bytes $b -Items $i -Failed $f -Detail $detail
-    }
-
-    # ── 12. Teams cache (opt-in) ───────────────────────────────────────────────
-    if ($CleanTeamsCache) {
-        Invoke-CleanupTask -Name 'TeamsCache' -Action {
-            if (Test-ProcessRunning -Names @('Teams','ms-teams')) {
-                Add-TaskResult -Task 'TeamsCache' -Status 'SKIPPED' -Detail 'Teams is running.'
-                return
-            }
-            $b = [double]0; $i = 0; $f = 0
-            $subs = @(
-                'AppData\Roaming\Microsoft\Teams\Cache',
-                'AppData\Roaming\Microsoft\Teams\GPUCache',
-                'AppData\Roaming\Microsoft\Teams\Code Cache',
-                'AppData\Roaming\Microsoft\Teams\Service Worker\CacheStorage',
-                'AppData\Local\Packages\MSTeams_8wekyb3d8bbwe\LocalCache\Microsoft\MSTeams\PerfLogs'
-            )
-            foreach ($p in $profilePaths) {
-                foreach ($s in $subs) {
-                    $r = Clear-PathAgedFiles -Path (Join-Path $p $s) -OlderThanDays 0 -RemoveEmptyDirs
-                    $b += $r.Bytes; $i += $r.Items; $f += $r.Failed
-                }
-            }
-            Add-TaskResult -Task 'TeamsCache' -Bytes $b -Items $i -Failed $f
-        }
-    }
-
-    # ── 13. Recycle Bin (opt-in, age-aware) ────────────────────────────────────
-    if ($EmptyRecycleBin) {
-        Invoke-CleanupTask -Name 'RecycleBin' -Action {
-            $b = [double]0; $i = 0; $f = 0
-            $cutoff  = (Get-Date).AddDays(-[math]::Abs($RecycleBinAgeDays))
-            $binRoot = "$SystemDrive\`$Recycle.Bin"
-            if (-not (Test-Path -LiteralPath $binRoot)) {
-                Add-TaskResult -Task 'RecycleBin' -Status 'SKIPPED' -Detail 'No recycle bin on system drive.'
-                return
-            }
-            # $I* files are written at deletion time, so their LastWriteTime is the deletion date.
-            foreach ($sidDir in (Get-ChildItem -LiteralPath $binRoot -Directory -Force -ErrorAction SilentlyContinue)) {
-                if (Test-Deadline) { break }
-                foreach ($meta in (Get-ChildItem -LiteralPath $sidDir.FullName -Filter '$I*' -Force -File -ErrorAction SilentlyContinue)) {
-                    try {
-                        if ($meta.LastWriteTime -ge $cutoff) { continue }
-                        $dataPath = Join-Path $sidDir.FullName ('$R' + $meta.Name.Substring(2))
-                        $size = [double]0
-                        if (Test-Path -LiteralPath $dataPath) {
-                            $d = Get-Item -LiteralPath $dataPath -Force
-                            if ($d -is [System.IO.DirectoryInfo]) {
-                                $size = [double](( Get-ChildItem -LiteralPath $dataPath -Recurse -Force -File -ErrorAction SilentlyContinue |
-                                                   Measure-Object -Property Length -Sum).Sum)
-                            } else { $size = [double]$d.Length }
-                            if (-not $ReportOnly) { Remove-Item -LiteralPath $dataPath -Recurse -Force -ErrorAction Stop }
-                        }
-                        if (-not $ReportOnly) { Remove-Item -LiteralPath $meta.FullName -Force -ErrorAction SilentlyContinue }
-                        $b += $size; $i++
-                    } catch { $f++ }
-                }
-            }
-            Add-TaskResult -Task 'RecycleBin' -Bytes $b -Items $i -Failed $f `
-                           -Detail "Items deleted more than $RecycleBinAgeDays day(s) ago."
-        }
-    }
-
-    # ── 14. Windows.old / upgrade leftovers (opt-in) ───────────────────────────
-    if ($RemoveWindowsOld) {
-        Invoke-CleanupTask -Name 'WindowsOld' -Action {
-            $b = [double]0; $i = 0
-            $cutoff = (Get-Date).AddDays(-$WindowsOldAgeDays)
-            foreach ($target in @("$SystemDrive\Windows.old", "$SystemDrive\`$Windows.~BT", "$SystemDrive\`$Windows.~WS")) {
-                if (-not (Test-Path -LiteralPath $target)) { continue }
-                $created = (Get-Item -LiteralPath $target -Force).CreationTime
-                if ($created -ge $cutoff) {
-                    Write-Log "Skipping '$target': only $([int]((Get-Date)-$created).TotalDays) day(s) old (rollback window)." -Level WARN
-                    continue
-                }
-                $size = [double]((Get-ChildItem -LiteralPath $target -Recurse -Force -File -ErrorAction SilentlyContinue |
-                                  Measure-Object -Property Length -Sum).Sum)
-                if (-not $ReportOnly) {
-                    # takeown/icacls are required; these trees are owned by TrustedInstaller.
-                    & takeown.exe /F $target /R /A /D Y *>$null
-                    & icacls.exe  $target /grant "*S-1-5-32-544:F" /T /C *>$null
-                    Remove-Item -LiteralPath $target -Recurse -Force -ErrorAction SilentlyContinue
-                }
-                $b += $size; $i++
-            }
-            Add-TaskResult -Task 'WindowsOld' -Bytes $b -Items $i -Detail 'OS rollback capability removed for these trees.'
-        }
-    }
-
-    # ── 15. Component store cleanup (opt-in) ───────────────────────────────────
-    if ($RunComponentCleanup) {
-        Invoke-CleanupTask -Name 'ComponentCleanup' -Action {
-            if ($ReportOnly) {
-                Add-TaskResult -Task 'ComponentCleanup' -Status 'SKIPPED' -Detail 'Not measured in report-only mode.'
-                return
-            }
-            if (Test-ProcessRunning -Names @('TiWorker','TrustedInstaller','Dism')) {
-                Add-TaskResult -Task 'ComponentCleanup' -Status 'SKIPPED' -Detail 'Servicing operation already running.'
-                return
-            }
-            $pre  = Get-FreeSpaceBytes
-            $proc = Start-Process -FilePath "$env:SystemRoot\System32\Dism.exe" `
-                                  -ArgumentList '/Online /Cleanup-Image /StartComponentCleanup /NoRestart /Quiet' `
-                                  -PassThru -WindowStyle Hidden
-            try { $proc.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::BelowNormal } catch { }
-
-            if (-not $proc.WaitForExit($ComponentCleanupTimeoutMin * 60 * 1000)) {
-                try { $proc.Kill() } catch { }
-                Add-TaskResult -Task 'ComponentCleanup' -Status 'TIMEOUT' `
-                               -Detail "Exceeded $ComponentCleanupTimeoutMin min; process terminated."
-                return
-            }
-            $delta = [math]::Max(0, (Get-FreeSpaceBytes) - $pre)
-            if ($proc.ExitCode -in @(0, 3010)) {
-                Add-TaskResult -Task 'ComponentCleanup' -Bytes $delta -Detail "DISM exit $($proc.ExitCode)."
-            } else {
-                Add-TaskResult -Task 'ComponentCleanup' -Bytes $delta -Status 'WARN' -Detail "DISM exit $($proc.ExitCode)."
-            }
-        }
-    }
-
-    # ── 16. Stale user profiles (opt-in) ───────────────────────────────────────
-    if ($RemoveStaleProfiles) {
-        Invoke-CleanupTask -Name 'StaleProfiles' -Action {
-            $cutoff  = (Get-Date).AddDays(-$ProfileAgeDays)
-            $current = ''
-            try { $current = (Get-CimInstance Win32_ComputerSystem).UserName } catch { }
-            $excludeNames = @('Administrator','Admin','Public','Default','defaultuser0','WDAGUtilityAccount')
-
-            $candidates = @(Get-CimInstance -ClassName Win32_UserProfile -ErrorAction Stop | Where-Object {
-                -not $_.Special -and
-                -not $_.Loaded  -and
-                $_.LocalPath -and
-                $_.LocalPath -like "$SystemDrive\Users\*" -and
-                ($_.LocalPath.Split('\')[-1] -notin $excludeNames) -and
-                ($null -ne $_.LastUseTime) -and ($_.LastUseTime -lt $cutoff) -and
-                ($current -eq '' -or $current.Split('\')[-1] -ne $_.LocalPath.Split('\')[-1])
-            })
-
-            $b = [double]0; $i = 0; $f = 0
-            foreach ($prof in ($candidates | Sort-Object LastUseTime | Select-Object -First $MaxProfilesToRemove)) {
-                if (Test-Deadline) { break }
-                $size = [double]((Get-ChildItem -LiteralPath $prof.LocalPath -Recurse -Force -File -ErrorAction SilentlyContinue |
-                                  Measure-Object -Property Length -Sum).Sum)
-                Write-Log ("Stale profile: {0} (last used {1}, {2})" -f $prof.LocalPath, $prof.LastUseTime, (Format-Bytes $size))
-                if ($ReportOnly) { $b += $size; $i++; continue }
-                try {
-                    Remove-CimInstance -InputObject $prof -ErrorAction Stop
-                    $b += $size; $i++
-                    Write-Log "Removed profile: $($prof.LocalPath)"
-                } catch {
-                    $f++
-                    Write-Log "Failed to remove profile $($prof.LocalPath): $_" -Level WARN
-                }
-            }
-            Add-TaskResult -Task 'StaleProfiles' -Bytes $b -Items $i -Failed $f `
-                           -Detail "$($candidates.Count) candidate(s) unused for $ProfileAgeDays+ days; cap $MaxProfilesToRemove/run."
-        }
-    }
-
-    # ── 17. Old restore points / shadow copies (opt-in) ────────────────────────
-    if ($RemoveOldRestorePoints) {
-        Invoke-CleanupTask -Name 'RestorePoints' -Action {
-            $shadows = @(Get-CimInstance -ClassName Win32_ShadowCopy -ErrorAction SilentlyContinue |
-                         Where-Object { $_.VolumeName } | Sort-Object InstallDate -Descending)
-            if ($shadows.Count -le $KeepRestorePoints) {
-                Add-TaskResult -Task 'RestorePoints' -Status 'SKIPPED' `
-                               -Detail "$($shadows.Count) shadow copies present; keeping $KeepRestorePoints."
-                return
-            }
-            $pre = Get-FreeSpaceBytes
-            $doomed = $shadows | Select-Object -Skip $KeepRestorePoints
-            $i = 0; $f = 0
-            foreach ($s in $doomed) {
-                if ($ReportOnly) { $i++; continue }
-                try { Remove-CimInstance -InputObject $s -ErrorAction Stop; $i++ } catch { $f++ }
-            }
-            $delta = if ($ReportOnly) { 0 } else { [math]::Max(0, (Get-FreeSpaceBytes) - $pre) }
-            Add-TaskResult -Task 'RestorePoints' -Bytes $delta -Items $i -Failed $f `
-                           -Detail "Kept the $KeepRestorePoints newest restore point(s)."
-        }
     }
 
     # ══ Summary ════════════════════════════════════════════════════════════════

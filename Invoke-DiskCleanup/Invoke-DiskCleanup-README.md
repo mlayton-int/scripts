@@ -17,13 +17,15 @@ It removes genuine junk — temp files, crash dumps, servicing logs, browser cac
 download payloads, Delivery Optimization cache — using an explicit allow-list of paths, age filters,
 and a path-safety gate that refuses to operate on anything resembling user data or critical system
 state. Riskier reclamation (Recycle Bin, `Windows.old`, WinSxS cleanup, stale profiles, restore
-points) exists but is **opt-in per run**.
+points) lives in **separate opt-in scripts** under [`Tasks\`](Tasks/README.md), each deployed and
+approved as its own procedure.
 
 It never kills a process, never shows a UI, never reboots, and never forces a locked file open.
 A `-ReportOnly` mode performs the full measurement pass and deletes nothing.
 
-**Typical yield:** 2–15 GB on a neglected workstation with default (safe) tasks only. Machines with
-`Windows.old` present or a bloated component store can yield considerably more with the opt-ins.
+**Typical yield:** 2–15 GB on a neglected workstation with this script's safe tasks. Machines with
+`Windows.old` present or a bloated component store can yield considerably more via the
+[`Tasks\`](Tasks/README.md) scripts.
 
 ---
 
@@ -147,39 +149,26 @@ Three of these have extra interlocks worth knowing:
   profile folders (`Default`, `Profile 1`, …) so multi-profile users are covered. Cookies, saved
   logins, history, and bookmarks are never enumerated.
 
-**Opt-in (each requires its switch):**
+**Opt-in tasks are separate scripts.**
 
-| # | Task | Switch | Trade-off |
-|---|---|---|---|
-| 12 | `TeamsCache` | `-CleanTeamsCache` | May force a Teams re-login on some builds. Skipped if Teams is running. |
-| 13 | `RecycleBin` | `-EmptyRecycleBin` | Removes the user's own undo. Age-gated by `-RecycleBinAgeDays` (30). |
-| 14 | `WindowsOld` | `-RemoveWindowsOld` | Removes OS rollback. Gated by `-WindowsOldAgeDays` (30). |
-| 15 | `ComponentCleanup` | `-RunComponentCleanup` | CPU-heavy DISM WinSxS cleanup. No `/ResetBase`. |
-| 16 | `StaleProfiles` | `-RemoveStaleProfiles` | Deletes unloaded profiles. Capped per run. |
-| 17 | `RestorePoints` | `-RemoveOldRestorePoints` | Deletes shadow copies beyond `-KeepRestorePoints`. |
+Everything that trades a recovery option for space now lives in [`Tasks\`](Tasks/README.md)
+as its own self-contained script, run from its own VSA procedure with its own log, summary and
+result file. This script performs only the always-safe cleanup above.
 
-Notes on the riskier ones:
+| Script | Task | Trade-off |
+|---|---|---|
+| `Tasks\Clear-AgedRecycleBin.ps1` | `RecycleBin` | Removes the user's own undo. Age-gated. |
+| `Tasks\Clear-TeamsCache.ps1` | `TeamsCache` | May force a Teams re-login on some builds. |
+| `Tasks\Remove-WindowsOld.ps1` | `WindowsOld` | Removes OS rollback. Age-gated. |
+| `Tasks\Invoke-ComponentCleanup.ps1` | `ComponentCleanup` | CPU-heavy DISM WinSxS cleanup. No `/ResetBase`. |
+| `Tasks\Remove-StaleProfile.ps1` | `StaleProfiles` | Deletes unloaded profiles. Capped per run. |
+| `Tasks\Remove-OldRestorePoint.ps1` | `RestorePoints` | Deletes shadow copies beyond the keep count. |
 
-- **`RecycleBin`** determines each item's deletion date from the `LastWriteTime` of its `$I`
-  metadata file, then removes both the `$R` payload and the `$I` record. This works across all users'
-  bins from SYSTEM, which `Clear-RecycleBin` does not.
-- **`WindowsOld`** is the only task that uses `takeown`/`icacls`, because those trees are owned by
-  TrustedInstaller. It refuses to act inside the rollback window.
-- **`ComponentCleanup`** runs DISM at `BelowNormal` priority with its own timeout
-  (`-ComponentCleanupTimeoutMin`, default 30). On timeout the process is terminated and the task is
-  reported as `TIMEOUT`; DISM's own transaction handling means a killed run is resumable. Exit codes
-  0 and 3010 are success. Skipped if a servicing operation is already in flight. Not measured under
-  `-ReportOnly`.
-- **`StaleProfiles`** requires the profile to be non-Special, **not loaded**, under `C:\Users`, with
-  a `LastUseTime` older than `-ProfileAgeDays` (120), a name not in the exclusion list
-  (`Administrator`, `Admin`, `Public`, `Default`, `defaultuser0`, `WDAGUtilityAccount`), and not
-  belonging to the currently logged-on user. It processes oldest-first and stops at
-  `-MaxProfilesToRemove` (5) per run — so a misconfiguration damages five profiles, not fifty.
-  Removal goes through `Remove-CimInstance` on the `Win32_UserProfile` object, which cleans the
-  registry `ProfileList` entry too, rather than orphaning it by deleting the folder.
+See [`Tasks\README.md`](Tasks/README.md) for their parameters, safety notes, deployment and
+rollout order.
 
-Tasks that can't self-report bytes (`DeliveryOptimization`, `ComponentCleanup`, `RestorePoints`)
-measure free-space delta before and after, clamped at zero. That figure is noisier than a file-by-file
+Tasks that can't self-report bytes (`DeliveryOptimization`) measure free-space delta before and
+after, clamped at zero. That figure is noisier than a file-by-file
 count because other processes are writing to disk concurrently.
 
 ### 3.6 Reporting and exit
@@ -206,9 +195,9 @@ The result string is written to `C:\ProgramData\Kaseya\ScriptResult_DiskCleanup.
 | `-LogFileAgeDays` | `14` | Minimum age for servicing and setup logs. Keep at least 7 if you ever troubleshoot upgrade failures. |
 | `-DumpFileAgeDays` | `7` | Minimum age for crash and memory dumps. Raise on machines under active BSOD investigation. |
 | `-UpdateCacheAgeDays` | `10` | Minimum age for Windows Update download payloads. |
-| `-RecycleBinAgeDays` | `30` | Only applies with `-EmptyRecycleBin`. |
-| `-WindowsOldAgeDays` | `30` | Only applies with `-RemoveWindowsOld`. Windows' own rollback window is 10 days; 30 is deliberately conservative. |
-| `-ProfileAgeDays` | `120` | Only applies with `-RemoveStaleProfiles`. |
+
+Age gates for the opt-in tasks are parameters of their own scripts — see
+[`Tasks\README.md`](Tasks/README.md).
 
 ### Run control
 
@@ -223,17 +212,8 @@ The result string is written to `C:\ProgramData\Kaseya\ScriptResult_DiskCleanup.
 
 ### Opt-in tasks
 
-| Parameter | Default | Description |
-|---|---|---|
-| `-EmptyRecycleBin` | off | Age-gated Recycle Bin purge across all users. |
-| `-CleanTeamsCache` | off | Teams cache folders. Skipped if Teams is running. |
-| `-RemoveWindowsOld` | off | `Windows.old`, `$Windows.~BT`, `$Windows.~WS`. |
-| `-RunComponentCleanup` | off | DISM `/StartComponentCleanup /NoRestart`. |
-| `-ComponentCleanupTimeoutMin` | `30` | Timeout for the above. |
-| `-RemoveStaleProfiles` | off | Stale profile removal. |
-| `-MaxProfilesToRemove` | `5` | Per-run cap on profile deletions. |
-| `-RemoveOldRestorePoints` | off | Shadow copy pruning. |
-| `-KeepRestorePoints` | `1` | Newest N restore points retained. |
+Not parameters of this script. Each is a separate procedure — see
+[`Tasks\README.md`](Tasks/README.md).
 
 ### Suggested profiles
 
@@ -245,11 +225,11 @@ The result string is written to `C:\ProgramData\Kaseya\ScriptResult_DiskCleanup.
 .\Invoke-DiskCleanup.ps1 -RunOnlyIfFreeSpaceBelowGB 20 -MaxRuntimeMinutes 30
 
 # Targeted remediation for a low-disk alert
-.\Invoke-DiskCleanup.ps1 -EmptyRecycleBin -RemoveWindowsOld -StopWhenFreeSpaceGB 25
+.\Invoke-DiskCleanup.ps1 -StopWhenFreeSpaceGB 25
 
-# Full reclaim — approved change window, machine expected to be idle
-.\Invoke-DiskCleanup.ps1 -EmptyRecycleBin -RemoveWindowsOld -RunComponentCleanup `
-                         -RemoveStaleProfiles -RemoveOldRestorePoints -MaxRuntimeMinutes 90
+# Then, if that was not enough, the opt-in tasks as their own procedures:
+.\Tasks\Remove-WindowsOld.ps1 -ReportOnly
+.\Tasks\Clear-AgedRecycleBin.ps1 -ReportOnly
 ```
 
 ---
@@ -405,7 +385,8 @@ A reasonable pattern:
   under two seconds.
 - **On low-disk alert:** targeted profile with `-StopWhenFreeSpaceGB` set to your alert clear
   threshold, so it stops as soon as the alert would clear.
-- **Quarterly / change window:** full reclaim including `-RunComponentCleanup`.
+- **Quarterly / change window:** the opt-in task procedures, particularly
+  `Tasks\Invoke-ComponentCleanup.ps1`. See [`Tasks\README.md`](Tasks/README.md).
 
 Passing switch parameters from VSA is done by including or omitting the switch text in the argument
 string; there is no `-Switch:$true` needed. If you build the argument line from a VSA variable,
@@ -461,14 +442,13 @@ still functions on machines where `WindowsUpdateCache` ran.
 Schedule weekly. Trend `FreeAfterGB` from the JSON summaries to identify machines that need the
 opt-ins or a bigger disk.
 
-### Phase 4 — Opt-ins, individually
+### Phase 4 — Opt-in tasks, individually
 
-Introduce one switch at a time, each with its own pilot. Suggested order, least to most contentious:
-`-RemoveWindowsOld` → `-RunComponentCleanup` → `-EmptyRecycleBin` → `-RemoveStaleProfiles` →
-`-RemoveOldRestorePoints`.
+Introduce one task procedure at a time, each with its own pilot. Suggested order and the
+per-task caveats are in [`Tasks\README.md`](Tasks/README.md) §6.
 
-`-EmptyRecycleBin` and `-RemoveStaleProfiles` are the two that generate help desk tickets. Both
-deserve a user-facing communication before they go fleet-wide.
+`Clear-AgedRecycleBin` and `Remove-StaleProfile` are the two that generate help desk tickets.
+Both deserve a user-facing communication before they go fleet-wide.
 
 ### Change-control notes
 
