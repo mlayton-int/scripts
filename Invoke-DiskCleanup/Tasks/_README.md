@@ -24,8 +24,14 @@ code has to be applied to each.
 | `Remove-StaleProfile.ps1` | `StaleProfiles` | Everything in the removed profiles. No undo. |
 | `Remove-OldRestorePoint.ps1` | `RestorePoints` | System Restore points and Previous Versions. |
 
-Every script accepts `-Delete` (omit it to report only — that is the default) and
-`-MaxRuntimeMinutes` (default 45) in addition to its own parameters below.
+Every script accepts `-Delete` — omit it to report only, which is the default.
+
+`-MaxRuntimeMinutes` (default 45) is accepted only by `Clear-AgedRecycleBin`,
+`Clear-TeamsCache` and `Remove-StaleProfile`, the three that iterate enough work for a
+deadline to mean something. The other three previously accepted it and silently ignored it;
+it has been removed rather than left as a false promise. For `Invoke-ComponentCleanup` the
+real cap is `-ComponentCleanupTimeoutMin`; for `Remove-WindowsOld` and
+`Remove-OldRestorePoint` it is the VSA procedure timeout.
 
 `Clear-AgedRecycleBin` is named to avoid colliding with PowerShell 5.1's built-in
 `Clear-RecycleBin` cmdlet, which cannot reach other users' bins from SYSTEM.
@@ -54,7 +60,11 @@ Every script accepts `-Delete` (omit it to report only — that is the default) 
   recent safety net.
 - **`WindowsOld`** is the only task that uses `takeown`/`icacls`, because those trees are
   owned by TrustedInstaller. It refuses to act inside the rollback window and logs why.
-  Usually the largest single reclaim available on a recently upgraded machine.
+  Usually the largest single reclaim available on a recently upgraded machine. Partial
+  removal is normal here, so the tree is re-measured afterwards and only the bytes that
+  actually went are reported; a tree that survives in part is counted in `Failed` and the
+  task reports `WARN`. If you see that, compare `ReclaimedGB` against `FreeSpaceDeltaGB`
+  and check the WARN lines for `takeown`/`icacls` exit codes.
 - **`ComponentCleanup`** runs DISM at `BelowNormal` priority with its own timeout. On
   timeout the process is terminated and the task reports `TIMEOUT`; DISM's transaction
   handling means a killed run is resumable. Exit codes 0 and 3010 are success. Skipped if a

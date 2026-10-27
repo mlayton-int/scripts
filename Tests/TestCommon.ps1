@@ -129,6 +129,35 @@ function Get-ScriptHelpText {
     } finally { $ErrorActionPreference = $old }
 }
 
+function Test-ScriptSynopsis {
+    <#
+        Returns $true only if the script supplies a real .SYNOPSIS.
+
+        Matching 'SYNOPSIS' in the rendered help text is NOT enough: Get-Help prints that
+        section header whether or not the script supplies one. Nor is "synopsis is
+        non-empty" enough. Measured across the three states:
+
+          has .SYNOPSIS            -> 'Removes Windows.old and ...'   (the text)
+          help block, no .SYNOPSIS -> ''                              (empty)
+          help block SUPPRESSED    -> 'Script.ps1 [[-Foo] <int>]'     (the syntax line)
+
+        So suppressed help yields a NON-EMPTY synopsis, and a bare non-empty test would
+        pass on exactly the failure this is meant to catch. Both conditions are required:
+        non-blank, and not the auto-generated syntax line (which always leads with the
+        script's own file name).
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+    $old = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $leaf = Split-Path $Path -Leaf
+        $s = (& powershell -NoProfile -ExecutionPolicy Bypass `
+                           -Command "(Get-Help '$Path').Synopsis" 2>&1 | Out-String)
+        if ([string]::IsNullOrWhiteSpace($s)) { return $false }
+        return -not ($s -like "*$leaf*")
+    } finally { $ErrorActionPreference = $old }
+}
+
 # ── Assertions / reporting ────────────────────────────────────────────────────
 $script:Checks = @()
 

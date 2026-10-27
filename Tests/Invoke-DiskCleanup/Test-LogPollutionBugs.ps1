@@ -96,9 +96,14 @@ try {
     cmd /c mklink /J "$junction" "$sentinelDir" | Out-Null
 
     $g = Clear-PathAgedFiles -Path $junction -OlderThanDays 1
-    Add-TestCheck 'gate: reported Skipped'    $true (@($g)[-1].Skipped)
-    Add-TestCheck 'gate: measured nothing'    0     (@($g)[-1].Items)
+    Add-TestCheck 'gate: return is clean'     1     (@($g).Count)
+    Add-TestCheck 'gate: measured nothing'    0     ($g.Items)
     Add-TestCheck 'gate: sentinel intact'     $true (Test-Path -LiteralPath $sentinelFile)
+    # The rejection is asserted through $script:PathSkips - the same channel
+    # Invoke-CleanupTask drains and logs in production. This replaces an assertion on a
+    # result.Skipped field that has been removed: nothing ever read it, so it proved only
+    # that the test could see it. PathSkips is what actually reaches the log.
+    Add-TestCheck 'gate: rejection recorded'  $true ([bool](@($script:PathSkips) -match 'reparse point'))
 
     # The predicate itself must return exactly one boolean plus a reason.
     $why = ''
@@ -134,7 +139,9 @@ try {
     try { $null = $r3.Bytes; $bytesOk = $true } catch { $bytesOk = $false }
     Add-TestCheck 'protected ext: $r.Bytes readable' $true $bytesOk
     Add-TestCheck 'protected ext: counted only .tmp' 1    $r3.Items
-    Add-TestCheck 'protected ext: counter incremented' 1  $r3.ProtectedSkipped
+    # Same reasoning as the gate check above: the surviving counter is the script-scope
+    # one Invoke-CleanupTask reports, not the discarded per-result field.
+    Add-TestCheck 'protected ext: counter incremented' 1  $script:ProtectedSkips
     Add-TestCheck 'protected ext: .bak still present' $true (Test-Path -LiteralPath (Join-Path $pdir 'keep.bak'))
 
     # ══ 4. Get-UserProfilePath fallback must return only paths ═══════════════

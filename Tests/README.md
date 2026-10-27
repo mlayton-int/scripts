@@ -10,8 +10,16 @@ written specifically to fail if a fixed bug ever comes back.
 .\Clear-RevitCache\Test-Guard.ps1          # one suite, full check-by-check table
 ```
 
-Each suite exits with its failure count, so the runner just sums them. Run a suite
-directly to see every individual check; the runner shows the roll-up.
+Each suite exits with its failure count, so the runner sums them. Run a suite directly to
+see every individual check; the runner shows the roll-up.
+
+A suite that ran **zero** checks is reported as `ERROR`, not `PASS`. The exit code alone is
+not enough: an error inside a suite's `try`/`finally` aborts the block, `finally` runs, and
+because suites set `$ErrorActionPreference = 'Continue'` execution resumes at
+`Write-TestSummary`, which reports "0 passed, 0 failed" and exits 0. That made a suite which
+died on its first assertion indistinguishable from a clean run, and it briefly hid a real
+regression. The runner now parses the check counts and any `ERROR` row contributes to the
+failure total, so an aborted suite can never exit 0.
 
 ---
 
@@ -50,8 +58,11 @@ tests are never deployed, so sharing helpers here costs nothing.
 - Teardown removes reparse points with `rmdir` **before** `Remove-Item -Recurse`, because
   several suites deliberately create junctions to test the safety gate and
   `Remove-Item -Recurse` would follow one and delete the target.
-- Every run of a cleanup script is `-ReportOnly` unless the suite is specifically testing
-  deletion on its own synthetic files.
+- Every run of a cleanup script uses its report-only default — no `-Delete` — unless the
+  suite is specifically testing deletion on its own synthetic files.
+- `Test-WindowsOldPartial.ps1` is the only suite that runs a `Tasks\` script with `-Delete`.
+  It runs a **patched copy** retargeted at a temp tree via env vars, and throws if either
+  patch anchor is missing, so it fails loudly rather than silently pointing at a real path.
 - `Test-TaskScripts.ps1` writes to the real production `$LogDir`. It records which files it
   created and removes exactly those, leaving pre-existing logs alone.
 - `Test-GuardEndToEnd.ps1` is the only suite touching a real profile. It requires an
@@ -157,25 +168,63 @@ exactly that reason.
 Covers the six opt-in scripts split out of `Invoke-DiskCleanup.ps1`, and the seams where
 that split could break:
 
-- All 7 scripts run under `-ReportOnly`, exit 0, and write all three outputs
-  (`.log`, `_Summary.json`, `ScriptResult_*.txt`) into the configured `$LogDir`. The
-  expected folder is **read from each script's own `$LogDir` assignment**, not hardcoded —
-  so moving the output directory stays a one-line change and this suite follows it. It
-  also asserts all 7 agree on the same `$LogDir`.
+- All 7 scripts run with no arguments (report-only is the default), exit 0, and write all
+  three outputs (`.log`, `_Summary.json`, `ScriptResult_*.txt`) into the configured
+  `$LogDir`. The expected folder is **read from each script's own `$LogDir` assignment**,
+  not hardcoded — so moving the output directory stays a one-line change and this suite
+  follows it. It also asserts all 7 agree on the same `$LogDir`.
 - Each `_Summary.json` is valid JSON naming the right `$ScriptName`.
-- `Get-Help` renders a SYNOPSIS for all 7. This guards a PowerShell 5.1 quirk that has
-  silently broken twice: **any** non-blank line abutting the `<#` help block — a
-  `#Requires`, or even a comment — suppresses comment-based help entirely, leaving a bare
-  syntax line. It took `Invoke-DiskCleanup.ps1` from 11,100 characters of help to 650.
+- Comment-based help, as **two** separate checks, because they fail on different things:
+  - *help renders* — a `DESCRIPTION` section is present. This guards a PowerShell 5.1 quirk
+    that has silently broken twice: **any** non-blank line abutting the `<#` block — a
+    `#Requires`, or even a comment — suppresses comment-based help entirely. It once took
+    `Invoke-DiskCleanup.ps1` from 11,100 characters of help to 650.
+  - *real SYNOPSIS* — the script actually supplies `.SYNOPSIS`. Matching the literal
+    `SYNOPSIS` in rendered help does **not** test this, because `Get-Help` prints that
+    header regardless; the original check did exactly that and passed on the main script,
+    which had no `.SYNOPSIS` at all. Asserting "synopsis is non-empty" is vacuous in the
+    opposite direction: when help is fully suppressed, `.Synopsis` falls back to the
+    auto-generated *syntax line*, which is non-empty. `Test-ScriptSynopsis` requires both —
+    non-blank **and** not the syntax line.
+- Version consistency: each script's help `.NOTES Version` must equal its `$ScriptVersion`.
+  `$ScriptVersion` is what reaches the log header and the summary JSON, so a help block
+  claiming something else is a silent lie. They had drifted to 2.0.0 vs 1.0.1.
+- Doc links: every relative markdown link in both READMEs and the changelog must resolve.
+  `Tasks\README.md` was renamed to `Tasks\_README.md` leaving 9 dead referrers, and nothing
+  noticed because a broken link costs nothing at runtime.
 - Log-rotation isolation: the main script's prune filter once matched every per-task log
   (`DiskCleanup_*.log`) and would have deleted them. A seeded task archive must survive a
   main-script rotation.
 - The removed opt-in switches are genuinely gone — passing `-EmptyRecycleBin` must fail as
-  an unknown parameter.
+  an unknown parameter, as must the retired `-ReportOnly`.
 
-`ComponentCleanup` and `WindowsOld` are destructive and slow; their deletion paths are
-deliberately **not** exercised (report mode neither invokes DISM nor takes ownership) and
-were verified by inspection instead.
+`ComponentCleanup`'s deletion path is deliberately **not** exercised — it is slow, and
+report mode does not invoke DISM — and is verified by inspection instead. `WindowsOld` has
+its own suite below.
+
+### Invoke-DiskCleanup\Test-WindowsOldPartial.ps1 — partial-removal reporting
+
+The only suite that runs a `Tasks\` script's live `-Delete` path, because the behaviour it
+covers cannot be reached any other way: it only misbehaves when `Remove-Item` partially
+fails, which never happens on a healthy machine and cannot be provoked in report mode. A
+3 MB temp tree is built with 2 MB held open under `FileShare.None` for the duration of the
+child process, which makes the removal partially fail on demand.
+
+Two real bugs, both locked in:
+
+- **Over-reporting.** The task measured the tree, called `Remove-Item -Recurse -Force
+  -ErrorAction SilentlyContinue`, then unconditionally credited the full pre-measured size —
+  with no failure counter at all. Verified load-bearing by reverting just that line: the
+  task then reports 3,145,728 bytes where only 1,048,576 actually went. On a real 12 GB
+  `Windows.old` with a locked subtree it would have claimed the whole 12 GB.
+- **A `takeown` failure aborted the entire task.** `& takeown.exe ... *>$null` looks like it
+  discards output, but in PowerShell 5.1 redirecting a native command's stderr wraps each
+  line in a `NativeCommandError`, which under `$ErrorActionPreference = 'Stop'` is
+  *terminating*. takeown writes to stderr on exactly the failures worth reporting, so the
+  task threw on its first stderr line and logged `FAILED` without attempting the removal.
+  Both `*>$null` and `2>$null` were verified to throw this way.
+
+Unelevated is the more interesting run: takeown then fails, so one execution covers both.
 
 ---
 

@@ -65,14 +65,30 @@ foreach ($s in $suites) {
     $out   = Invoke-ScriptUnderTest -Path $s.FullName -Arguments $suiteArgs
     $fails = Get-LastScriptExit
     # Echo just the suite's own summary line; the full table stays in the suite output.
-    ($out | Out-String) -split "`n" | Where-Object { $_ -match 'passed,\s*\d+ failed' } |
-        ForEach-Object { Write-Output $_.Trim() }
+    $summary = @(($out | Out-String) -split "`n" | Where-Object { $_ -match '(\d+) passed,\s*(\d+) failed' })
+    $summary | ForEach-Object { Write-Output $_.Trim() }
+
+    # A suite that ran ZERO checks is an error, not a pass. An error inside a suite's
+    # try/finally aborts the whole block; finally runs, and because suites set
+    # $ErrorActionPreference = 'Continue' execution then resumes at Write-TestSummary,
+    # which duly reports "0 passed, 0 failed" and exits 0. Scoring that on the exit code
+    # alone reports a suite that died on its first assertion as PASS - which is exactly
+    # how a removed property silently disabled the whole LogPollution suite once.
+    $ran = -1
+    if ($summary.Count -gt 0 -and $summary[-1] -match '(\d+) passed,\s*(\d+) failed') {
+        $ran = [int]$Matches[1] + [int]$Matches[2]
+    }
+
+    $result = 'PASS'; $note = ''
+    if ($ran -lt 0)      { $result = 'ERROR'; $note = 'no summary line - suite did not complete' }
+    elseif ($ran -eq 0)  { $result = 'ERROR'; $note = 'ran 0 checks - suite aborted early' }
+    elseif ($fails -gt 0){ $result = 'FAIL' }
 
     $rows.Add([PSCustomObject]@{
         Suite    = $rel
-        Result   = $(if ($fails -eq 0) { 'PASS' } else { 'FAIL' })
-        Failures = $fails
-        Note     = ''
+        Result   = $result
+        Failures = $(if ($result -eq 'ERROR' -and $fails -eq 0) { 1 } else { $fails })
+        Note     = $note
     })
 }
 
@@ -80,17 +96,24 @@ Write-Output "`n══ Aggregate ══"
 $rows | Format-Table -AutoSize
 
 # Measure-Object over an empty set returns nothing, so .Sum would throw under
-# StrictMode - which is the all-passing case.
-$failedRows = @($rows | Where-Object Result -eq 'FAIL')
-$totalFail  = 0
-if ($failedRows.Count -gt 0) {
-    $totalFail = [int](($failedRows | Measure-Object -Property Failures -Sum).Sum)
+# StrictMode - which is the all-passing case. ERROR rows count toward the total so an
+# aborted suite can never exit 0.
+$badRows   = @($rows | Where-Object { $_.Result -in @('FAIL','ERROR') })
+$totalFail = 0
+if ($badRows.Count -gt 0) {
+    $totalFail = [int](($badRows | Measure-Object -Property Failures -Sum).Sum)
 }
-$skipped = @($rows | Where-Object Result -eq 'SKIPPED').Count
+$errored = @($rows | Where-Object Result -eq 'ERROR').Count
 
-Write-Output ("Suites: {0} pass, {1} fail, {2} skipped. Total failing checks: {3}" -f
+Write-Output ("Suites: {0} pass, {1} fail, {2} error, {3} skipped. Total failing checks: {4}" -f
     @($rows | Where-Object Result -eq 'PASS').Count,
     @($rows | Where-Object Result -eq 'FAIL').Count,
-    $skipped, $totalFail)
+    $errored,
+    @($rows | Where-Object Result -eq 'SKIPPED').Count,
+    $totalFail)
+
+if ($errored -gt 0) {
+    Write-Warning "$errored suite(s) aborted without running their checks - see the Note column."
+}
 
 exit $totalFail

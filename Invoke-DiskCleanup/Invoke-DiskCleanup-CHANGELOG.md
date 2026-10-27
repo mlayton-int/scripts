@@ -1,5 +1,152 @@
 # Changelog — Invoke-DiskCleanup.ps1
 
+## 2026-09-03 (audit)
+
+Full read-through of all 7 scripts and both READMEs as one body of work, after three rounds
+of structural change (task extraction, the log-pollution fixes, the `$LogDir` move, the
+`-Delete` inversion) that had only ever been verified in isolation. PSScriptAnalyzer was
+already clean of unexpected findings, so everything below is something static analysis
+cannot see.
+
+### Breaking: `-MaxRuntimeMinutes` removed from 3 task scripts
+
+`Invoke-ComponentCleanup`, `Remove-OldRestorePoint` and `Remove-WindowsOld` each declared the
+parameter, documented it as "Hard cap on total runtime", and assigned `$script:Deadline` from
+it — but **none of the three defined `Test-Deadline` or ever read the value**. The cap did
+nothing, and `StoppedEarly` / `StopReason` in their summary JSON were permanently `false` /
+`""`. PSScriptAnalyzer could not flag it because the parameter *was* referenced, just only to
+compute a value nothing consumed.
+
+Removed rather than implemented, because on the merits it earns nothing in any of the three:
+`Invoke-ComponentCleanup` already enforces `-ComponentCleanupTimeoutMin` via `WaitForExit`,
+`Remove-OldRestorePoint`'s loop is fast and bounded, and `Remove-WindowsOld`'s cost is a
+single blocking `Remove-Item` that a deadline check cannot interrupt anyway.
+
+- **A VSA procedure passing `-MaxRuntimeMinutes` to any of those three will now fail** as an
+  unknown parameter rather than silently ignore it. Drop the argument.
+- The parameter is unchanged and still functional in the other four
+  (`Invoke-DiskCleanup`, `Clear-AgedRecycleBin`, `Clear-TeamsCache`, `Remove-StaleProfile`),
+  which do define and call `Test-Deadline`.
+- `StoppedEarly` / `StopReason` dropped from those three scripts' summary JSON, since nothing
+  could ever set them.
+
+### Fixed: `Remove-WindowsOld` reported space it had not reclaimed
+
+It measured the tree, called `Remove-Item -Recurse -Force -ErrorAction SilentlyContinue`, then
+unconditionally added the full pre-measured size to the reclaimed total. The task had **no
+failure counter at all**. Partial failure on these trees is normal — locked files, ACL edge
+cases — so `ReclaimedGB` could claim the whole tree while little or nothing actually went, and
+the only contradicting evidence was a `FreeSpaceDeltaGB` that nothing compared it against.
+
+`SilentlyContinue` is retained deliberately (a partial failure must not abort the task), but
+its result is no longer trusted: the target is re-measured afterwards, only
+`$size - $remaining` is reported, the tree is counted in `Failed`, and the task reports
+`WARN` with a log line naming the bytes left behind.
+
+### Fixed: a `takeown` failure aborted the whole WindowsOld task
+
+Found while building a test for the partial-removal path above, and **pre-existing** rather
+than introduced by it. `takeown.exe` / `icacls.exe` were invoked as
+`& takeown.exe ... *>$null`, intended to discard their output. But in Windows PowerShell 5.1,
+redirecting a native command's stderr *inside* PowerShell wraps each line in a
+`NativeCommandError` record, and under `$ErrorActionPreference = 'Stop'` that is a
+**terminating** error. takeown writes to stderr on exactly the failures worth reporting — a
+non-elevated run emits `ERROR: The current logged on user does not have administrative
+privileges.` — so the task threw on takeown's first stderr line and was logged as `FAILED`
+without attempting the removal at all.
+
+Verified that both `*>$null` and `2>$null` throw this way, and that only lowering the
+preference around the call does not. Both invocations now go through a small
+`Invoke-NativeTool` helper that drops `$ErrorActionPreference` to `Continue` for the duration,
+captures the exit code, and logs a WARN naming the tool, its exit code and its first output
+line. Without this the new exit-code check above was unreachable in precisely the case it
+existed to report.
+
+### Changed: `ThumbnailCache` no longer reports a fabricated `Failed` count
+
+When `explorer.exe` was running it looped every user profile incrementing `Failed`, reporting
+e.g. `0 B from 0 items (3 skipped/locked)` when nothing had been attempted — three phantom
+locked files in fleet reporting. The check is loop-invariant, so it now runs once and the task
+reports `Status: SKIPPED` with `Failed: 0`. Visible in the summary JSON.
+
+### Main script version settled at 2.0.0
+
+It was inconsistent three ways: help block `2.0.0`, `$ScriptVersion = '1.0.1'` (the value that
+actually reaches the log header and summary JSON), README `1.0`. `2.0.0` is correct — since
+1.x this script shed 6 opt-in switches to separate scripts and inverted its delete default.
+The 6 task scripts were already self-consistent at `1.0.0` and are unchanged.
+
+### Documentation corrected
+
+- **9 broken links to `Tasks\README.md`.** The file is `Tasks\_README.md`, renamed in
+  `3d5685e` / `3769614` without updating referrers: 8 markdown links in
+  `Invoke-DiskCleanup-README.md` plus one prose reference in the script's own `.DESCRIPTION`
+  — which was also pointing readers at the Tasks doc for *this* script's parameters, and now
+  points at `Invoke-DiskCleanup-README.md`.
+- **README §3.2 described the log-pollution bug as intended behaviour.** It said
+  `Test-SafeCleanupPath` "returns `$false`, logs a warning, and skips the target". That
+  logging *was* the safety-gate bypass fixed on 2026-09-02. Rewritten, with a note that the
+  no-logging property is part of the control rather than a style preference.
+- **README §3.3 claimed protected files are "logged by name".** They are counted and reported
+  as a per-task total. The sample log and the Phase 1 audit guidance in §8 both showed the
+  removed `Protected extension preserved:` line format.
+- Sample output showed `Top: WindowsOld 9.77 GB` — a task this script no longer has — and a
+  `Path rejected (reason): path` format that never occurs, since the reason string already
+  contains the path.
+- Added an `Outputs` block and a `.SYNOPSIS` to the main script's help, and reordered it to
+  `.SYNOPSIS` → `.DESCRIPTION` → `.NOTES` → `.PARAMETER` to match the 6 task scripts. It was
+  the only one of the 7 with no `.SYNOPSIS` at all.
+- `Tasks\_README.md` claimed all six scripts accept `-MaxRuntimeMinutes`; it now names the
+  three that do, and documents the `WindowsOld` partial-removal reporting.
+
+### Complexity removed
+
+- **`Clear-PathAgedFiles` returned 6 fields, 3 of which nothing read.** `Skipped`,
+  `SkipReason` and `ProtectedSkipped` were maintained at every exit path while the actual
+  diagnostic channel was `$script:PathSkips` / `$script:ProtectedSkips`. Reduced to
+  `Bytes` / `Items` / `Failed` — the three every call site uses — in both the main script and
+  `Clear-TeamsCache`.
+- `Get-WorkstationJoinType` ran `dsregcmd` once, then made six `Select-String` passes over its
+  output to derive three booleans. Now two regex matches; the two flags fully determine all
+  four outcomes. The `JoinType` field is unchanged.
+- `MemoryDumps` looped over a one-element array holding a hardcoded path. Collapsed to an `if`.
+
+### Tests
+
+- **The `help has SYNOPSIS` check was vacuous.** It matched `SYNOPSIS` in `Get-Help -Full`
+  output, but PowerShell prints that section header whether or not the script supplies one —
+  so it passed on the main script, which had none. Asserting "synopsis is non-empty" would
+  have been vacuous too, in the opposite direction: when help is fully suppressed by the PS
+  5.1 blank-line quirk, `.Synopsis` falls back to the auto-generated *syntax line*, which is
+  non-empty. Measured all three states and split it into two checks — `help renders`
+  (DESCRIPTION present) and `real SYNOPSIS` (non-blank **and** not the syntax line, via the
+  new `Test-ScriptSynopsis` helper).
+- Added a version-consistency check comparing each script's help `.NOTES Version` against its
+  `$ScriptVersion`. This is what would have caught the 2.0.0/1.0.1 drift.
+- Added a link check asserting every relative markdown link in both READMEs and this changelog
+  resolves to a file that exists. It caught all 8 broken README links on first run.
+- **`Invoke-AllTests.ps1` scored an aborted suite as a pass.** Trimming the unread result
+  fields broke an assertion in `Test-LogPollutionBugs.ps1`, and the whole suite went quiet
+  instead of failing: an error inside a suite's `try`/`finally` aborts the block, `finally`
+  runs, and because suites set `$ErrorActionPreference = 'Continue'` execution then resumes at
+  `Write-TestSummary`, which reports "0 passed, 0 failed" and exits 0. The runner scored on
+  the exit code alone, so a suite that died on its first assertion read as PASS — it briefly
+  hid a real regression in this very changeset. The runner now parses the check counts and
+  reports `ERROR` for a suite that ran zero checks or produced no summary at all, contributing
+  to the failure total so the aggregate can never exit 0. All five classification cases were
+  verified directly.
+- The two assertions that broke now target `$script:PathSkips` / `$script:ProtectedSkips`
+  instead of the removed per-result fields — a strictly better test, since those are the
+  channels that actually reach the log in production.
+
+### PSScriptAnalyzer
+
+59 → **60** across the 7 files; main script unchanged at 17. No new rule types. The single
+addition is the new `Get-TreeBytes` helper in `Remove-WindowsOld` hitting `PSUseSingularNouns`,
+the same accepted cosmetic rule as `Format-Bytes`, `Get-FreeSpaceBytes` and
+`Clear-PathAgedFiles`. `PSReviewUnusedParameter` stays at 8 — the 3 removed parameters were
+never in that list, precisely because they were referenced without being used.
+
 ## 2026-09-03 (later)
 
 ### Reporting is now the default; deleting requires -Delete

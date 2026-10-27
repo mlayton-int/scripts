@@ -4,11 +4,8 @@
 #Requires -Version 5.1
 
 <#
-.NOTES
-    Author  : Michael Layton (Assisted by Claude.ai | Static analysis and testing completed manually)
-    Version : 2.0.0
-    Context : SYSTEM  (required - the script enumerates all user profiles and system paths)
-    Exit    : 0 = success (including partial task failures, which are logged), 1 = fatal error
+.SYNOPSIS
+    Unattended allow-list disk cleanup for managed Windows workstations.
 
 .DESCRIPTION
     Unattended disk cleanup for Kaseya VSA X agent procedures. Designed to be aggressive about
@@ -36,7 +33,19 @@
       - Browser cookies, logins, history, bookmarks, profiles - cache subfolders only.
       - DISM /ResetBase               - blocks uninstalling updates; not offered.
 
-      See Tasks\README.md for parameters and deployment.
+    Outputs
+      C:\INS-Temp\Logs\DiskCleanup.log
+      C:\INS-Temp\Logs\DiskCleanup_Summary.json
+      C:\INS-Temp\Logs\ScriptResult_DiskCleanup.txt
+
+    See Invoke-DiskCleanup-README.md for the full parameter reference and deployment
+    guidance, and Tasks\_README.md for the opt-in task scripts.
+
+.NOTES
+    Author  : Michael Layton (Assisted by Claude.ai | Static analysis and testing completed manually)
+    Version : 2.0.0
+    Context : SYSTEM  (required - the script enumerates all user profiles and system paths)
+    Exit    : 0 = success (including partial task failures, which are logged), 1 = fatal error
 
 .PARAMETER TempFileAgeDays
     Minimum age (days, last write time) for temp files to be removed. Default 2.
@@ -96,7 +105,7 @@ $ErrorActionPreference = 'Stop'
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 $ScriptName    = 'DiskCleanup'
-$ScriptVersion = '1.0.1'
+$ScriptVersion = '2.0.0'
 $LogDir        = 'C:\INS-Temp\Logs'
 $LogPath       = "$LogDir\$ScriptName.log"
 $SummaryPath   = "$LogDir\${ScriptName}_Summary.json"
@@ -179,14 +188,18 @@ function Write-VSAResult {
 
 # ── Join Type Detection ────────────────────────────────────────────────────────
 function Get-WorkstationJoinType {
+    <#
+        Logged for fleet correlation only - the cleanup logic itself is join-agnostic.
+        Two regex matches against the joined output rather than six Select-String passes
+        over the pipeline; the two flags fully determine the four outcomes.
+    #>
     try {
-        $dsreg = dsregcmd /status 2>$null
-        $adJoined  = ($dsreg | Select-String 'AzureAdJoined\s*:\s*NO' ) -and ($dsreg | Select-String 'DomainJoined\s*:\s*YES')
-        $aadJoined = ($dsreg | Select-String 'AzureAdJoined\s*:\s*YES') -and ($dsreg | Select-String 'DomainJoined\s*:\s*NO' )
-        $hybrid    = ($dsreg | Select-String 'AzureAdJoined\s*:\s*YES') -and ($dsreg | Select-String 'DomainJoined\s*:\s*YES')
-        if ($hybrid)    { return 'Hybrid' }
-        if ($adJoined)  { return 'AD'     }
-        if ($aadJoined) { return 'AAD'    }
+        $dsreg = (dsregcmd /status 2>$null) -join "`n"
+        $aad   = $dsreg -match 'AzureAdJoined\s*:\s*YES'
+        $dom   = $dsreg -match 'DomainJoined\s*:\s*YES'
+        if ($aad -and $dom)  { return 'Hybrid' }
+        if ($dom)            { return 'AD'     }
+        if ($aad)            { return 'AAD'    }
     } catch { }
     return 'Local'
 }
@@ -348,22 +361,19 @@ function Clear-PathAgedFiles {
         [switch]$RemoveEmptyDirs
     )
 
-    $result = [PSCustomObject]@{
-        Bytes = [double]0; Items = 0; Failed = 0; Skipped = $false
-        SkipReason = ''; ProtectedSkipped = 0
-    }
+    # Only these three fields; every caller reads exactly these. Earlier versions also
+    # carried Skipped/SkipReason/ProtectedSkipped, which nothing ever read - the real
+    # diagnostic channel is $script:PathSkips / $script:ProtectedSkips below.
+    $result = [PSCustomObject]@{ Bytes = [double]0; Items = 0; Failed = 0 }
 
-    if (-not (Test-Path -LiteralPath $Path)) {
-        $result.Skipped = $true; $result.SkipReason = "path not present: $Path"
-        return $result
-    }
+    # A missing path is not an error - most cleanup targets are absent on most machines.
+    if (-not (Test-Path -LiteralPath $Path)) { return $result }
 
     # This function must not log - it returns $result, and Write-Log writes to the
     # success stream. Rejections go to $script:PathSkips, which Invoke-CleanupTask
     # drains and logs after the task completes.
     $why = ''
     if (-not (Test-SafeCleanupPath -Path $Path -Reason ([ref]$why))) {
-        $result.Skipped = $true; $result.SkipReason = $why
         $script:PathSkips.Add($why)
         return $result
     }
@@ -396,7 +406,6 @@ function Clear-PathAgedFiles {
                 if ($ProtectedExtensions -contains $entry.Extension.ToLower()) {
                     # Counted, not logged: logging here would corrupt $result.
                     # Invoke-CleanupTask reports the total once the task finishes.
-                    $result.ProtectedSkipped++
                     $script:ProtectedSkips++
                     continue
                 }
@@ -589,18 +598,19 @@ try {
         $b = [double]0; $i = 0; $f = 0
         $cutoff = (Get-Date).AddDays(-$DumpFileAgeDays)
 
-        foreach ($dumpFile in @("$SystemDrive\Windows\MEMORY.DMP")) {
-            try {
-                if (Test-Path -LiteralPath $dumpFile) {
-                    $item = Get-Item -LiteralPath $dumpFile -Force
-                    if ($item.LastWriteTime -lt $cutoff) {
-                        $size = [double]$item.Length
-                        if (-not $ReportOnly) { Remove-Item -LiteralPath $dumpFile -Force -ErrorAction Stop }
-                        $b += $size; $i++
-                    }
+        # The full-memory dump is a single known file; the directories below it are
+        # handled by the engine.
+        $dumpFile = "$SystemDrive\Windows\MEMORY.DMP"
+        try {
+            if (Test-Path -LiteralPath $dumpFile) {
+                $item = Get-Item -LiteralPath $dumpFile -Force
+                if ($item.LastWriteTime -lt $cutoff) {
+                    $size = [double]$item.Length
+                    if (-not $ReportOnly) { Remove-Item -LiteralPath $dumpFile -Force -ErrorAction Stop }
+                    $b += $size; $i++
                 }
-            } catch { $f++ }
-        }
+            }
+        } catch { $f++ }
 
         foreach ($d in @("$SystemDrive\Windows\Minidump", "$SystemDrive\Windows\LiveKernelReports")) {
             $r = Clear-PathAgedFiles -Path $d -OlderThanDays $DumpFileAgeDays -IncludeFilter @('*.dmp')
@@ -714,16 +724,22 @@ try {
 
     # ── 10. Thumbnail / icon caches (only for users not logged on) ─────────────
     Invoke-CleanupTask -Name 'ThumbnailCache' -Action {
+        # The cache databases are held open by any active session, so this is all-or-
+        # nothing. Reported as SKIPPED rather than looping the profiles to count a
+        # Failed per profile - nothing is attempted, so a failure count is a fiction
+        # that shows up in fleet reporting as real locked files.
+        if (Test-ProcessRunning -Names @('explorer')) {
+            Add-TaskResult -Task 'ThumbnailCache' -Status 'SKIPPED' `
+                           -Detail 'An interactive session is active (cache files are locked).'
+            return
+        }
         $b = [double]0; $i = 0; $f = 0
-        $explorerRunning = Test-ProcessRunning -Names @('explorer')
         foreach ($p in $profilePaths) {
-            if ($explorerRunning) { $f++; continue }   # locked while a session is active; skip cleanly
             $r = Clear-PathAgedFiles -Path (Join-Path $p 'AppData\Local\Microsoft\Windows\Explorer') `
                                      -OlderThanDays $TempFileAgeDays -IncludeFilter @('thumbcache_*.db','iconcache_*.db')
             $b += $r.Bytes; $i += $r.Items; $f += $r.Failed
         }
-        $detail = if ($explorerRunning) { 'Skipped: an interactive session is active (cache files are locked).' } else { '' }
-        Add-TaskResult -Task 'ThumbnailCache' -Bytes $b -Items $i -Failed $f -Detail $detail
+        Add-TaskResult -Task 'ThumbnailCache' -Bytes $b -Items $i -Failed $f
     }
 
     # ── 11. Browser caches (cache subfolders only, closed browsers only) ───────

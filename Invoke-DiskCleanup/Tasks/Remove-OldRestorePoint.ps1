@@ -32,9 +32,6 @@
 .PARAMETER KeepRestorePoints
     Number of newest shadow copies to keep. Default 1.
 
-.PARAMETER MaxRuntimeMinutes
-    Hard cap on total runtime. Default 45.
-
 .PARAMETER Delete
     Actually delete. Omitted, the script counts what would be removed and deletes
     nothing - report-only is the default.
@@ -42,8 +39,7 @@
 
 [CmdletBinding()]
 param(
-    [int]$KeepRestorePoints  = 1,
-    [int]$MaxRuntimeMinutes  = 45,
+    [int]$KeepRestorePoints = 1,
     [switch]$Delete
 )
 
@@ -62,9 +58,7 @@ $LogPath       = "$LogDir\$ScriptName.log"
 $SummaryPath   = "$LogDir\${ScriptName}_Summary.json"
 $SystemDrive   = $env:SystemDrive
 
-$script:Deadline    = (Get-Date).AddMinutes($MaxRuntimeMinutes)
 $script:TaskResults = New-Object System.Collections.Generic.List[object]
-$script:StopReason  = ''
 
 if (-not (Test-Path -LiteralPath $LogDir)) {
     New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
@@ -208,8 +202,6 @@ try {
         FreeAfterGB      = [math]::Round($freeAfter / 1GB, 2)
         ReclaimedGB      = [math]::Round($reportedSum / 1GB, 2)
         FreeSpaceDeltaGB = [math]::Round($actualDelta / 1GB, 2)
-        StoppedEarly     = [bool]$script:StopReason
-        StopReason       = $script:StopReason
         Tasks            = $script:TaskResults
     }
     try { $summary | ConvertTo-Json -Depth 4 | Out-File -FilePath $SummaryPath -Encoding UTF8 -Force } catch { }

@@ -36,10 +36,8 @@
     this script's own timeout fires first and you still get a summary.
 
 .PARAMETER ComponentCleanupTimeoutMin
-    Minutes to allow DISM before terminating it. Default 30.
-
-.PARAMETER MaxRuntimeMinutes
-    Hard cap on total runtime. Default 45.
+    Minutes to allow DISM before terminating it. Default 30. This is the only runtime cap
+    the script enforces; past it, the VSA procedure timeout is the backstop.
 
 .PARAMETER Delete
     Actually run DISM. Omitted, the task reports SKIPPED without running it - the
@@ -49,7 +47,6 @@
 [CmdletBinding()]
 param(
     [int]$ComponentCleanupTimeoutMin = 30,
-    [int]$MaxRuntimeMinutes          = 45,
     [switch]$Delete
 )
 
@@ -68,9 +65,7 @@ $LogPath       = "$LogDir\$ScriptName.log"
 $SummaryPath   = "$LogDir\${ScriptName}_Summary.json"
 $SystemDrive   = $env:SystemDrive
 
-$script:Deadline    = (Get-Date).AddMinutes($MaxRuntimeMinutes)
 $script:TaskResults = New-Object System.Collections.Generic.List[object]
-$script:StopReason  = ''
 
 if (-not (Test-Path -LiteralPath $LogDir)) {
     New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
@@ -231,8 +226,6 @@ try {
         FreeAfterGB      = [math]::Round($freeAfter / 1GB, 2)
         ReclaimedGB      = [math]::Round($reportedSum / 1GB, 2)
         FreeSpaceDeltaGB = [math]::Round($actualDelta / 1GB, 2)
-        StoppedEarly     = [bool]$script:StopReason
-        StopReason       = $script:StopReason
         Tasks            = $script:TaskResults
     }
     try { $summary | ConvertTo-Json -Depth 4 | Out-File -FilePath $SummaryPath -Encoding UTF8 -Force } catch { }

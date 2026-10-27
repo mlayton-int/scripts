@@ -1,6 +1,6 @@
 # Invoke-DiskCleanup.ps1 — Documentation
 
-**Version:** 1.0
+**Version:** 2.0.0
 **Target:** Windows 10 / Windows 11 workstations (AD-joined, Azure AD-joined, Hybrid, Workgroup)
 **Platform:** Kaseya VSA X agent procedure
 **Execution context:** SYSTEM (required)
@@ -17,7 +17,7 @@ It removes genuine junk — temp files, crash dumps, servicing logs, browser cac
 download payloads, Delivery Optimization cache — using an explicit allow-list of paths, age filters,
 and a path-safety gate that refuses to operate on anything resembling user data or critical system
 state. Riskier reclamation (Recycle Bin, `Windows.old`, WinSxS cleanup, stale profiles, restore
-points) lives in **separate opt-in scripts** under [`Tasks\`](Tasks/README.md), each deployed and
+points) lives in **separate opt-in scripts** under [`Tasks\`](Tasks/_README.md), each deployed and
 approved as its own procedure.
 
 It never kills a process, never shows a UI, never reboots, and never forces a locked file open.
@@ -26,7 +26,7 @@ nothing.
 
 **Typical yield:** 2–15 GB on a neglected workstation with this script's safe tasks. Machines with
 `Windows.old` present or a bloated component store can yield considerably more via the
-[`Tasks\`](Tasks/README.md) scripts.
+[`Tasks\`](Tasks/_README.md) scripts.
 
 ---
 
@@ -71,8 +71,8 @@ These are deliberate refusals, documented so nobody "fixes" them later:
 
 ### 3.2 The safety gate — `Test-SafeCleanupPath`
 
-Every path handed to the deletion engine passes through this first. It returns `$false`, logs a
-warning, and skips the target if any of the following is true:
+Every path handed to the deletion engine passes through this first. It returns `$false` and the
+target is skipped if any of the following is true:
 
 - The path is empty, unparseable, shorter than four characters, or a bare drive root (`C:`).
 - The path exactly matches a protected path (`C:\Windows`, `C:\Users`, `C:\Program Files`,
@@ -83,6 +83,12 @@ warning, and skips the target if any of the following is true:
   `AppData\Roaming`. This is a structural guarantee that no cleanup task can reach a user's
   Documents, Desktop, or Downloads regardless of what someone adds to the task list later.
 - The path doesn't exist, isn't a directory, or **is a reparse point** (junction/symlink).
+
+Note what this function does *not* do: it never logs. `Write-Log` writes to the success stream, so
+a logging predicate returns `@(log line, $false)` — and `-not` on that non-empty array is `$false`,
+which silently bypassed this gate entirely. The rejection reason travels back through a
+`[ref]$Reason` out-parameter instead, and `Invoke-CleanupTask` logs it once the task finishes.
+Treat "this predicate must not log" as part of the control, not a style preference.
 
 ### 3.3 The deletion engine — `Clear-PathAgedFiles`
 
@@ -95,7 +101,9 @@ For each file found, deletion requires **all** of the following:
 
 - `LastWriteTime` older than the task's age threshold.
 - Extension not in `-ProtectedExtensions` (`.pst`, `.ost`, `.nst`, `.edb`, `.vhd`, `.vhdx`, `.avhdx`,
-  `.vhdpmem`, `.kdbx`, `.pfx`, `.p12`, `.key`, `.psafe3`, `.bak`). A preserved file is logged by name.
+  `.vhdpmem`, `.kdbx`, `.pfx`, `.p12`, `.key`, `.psafe3`, `.bak`). Preserved files are counted and
+  reported as a per-task total, not logged individually — for the same
+  success-stream reason described in §3.2.
 - The `System` file attribute is not set.
 - The name matches `-IncludeFilter`, when a task supplies one (e.g. thumbnail caches only match
   `thumbcache_*.db` and `iconcache_*.db`).
@@ -152,7 +160,7 @@ Three of these have extra interlocks worth knowing:
 
 **Opt-in tasks are separate scripts.**
 
-Everything that trades a recovery option for space now lives in [`Tasks\`](Tasks/README.md)
+Everything that trades a recovery option for space now lives in [`Tasks\`](Tasks/_README.md)
 as its own self-contained script, run from its own VSA procedure with its own log, summary and
 result file. This script performs only the always-safe cleanup above.
 
@@ -165,7 +173,7 @@ result file. This script performs only the always-safe cleanup above.
 | `Tasks\Remove-StaleProfile.ps1` | `StaleProfiles` | Deletes unloaded profiles. Capped per run. |
 | `Tasks\Remove-OldRestorePoint.ps1` | `RestorePoints` | Deletes shadow copies beyond the keep count. |
 
-See [`Tasks\README.md`](Tasks/README.md) for their parameters, safety notes, deployment and
+See [`Tasks\_README.md`](Tasks/_README.md) for their parameters, safety notes, deployment and
 rollout order.
 
 Tasks that can't self-report bytes (`DeliveryOptimization`) measure free-space delta before and
@@ -198,7 +206,7 @@ The result string is written to `C:\INS-Temp\Logs\ScriptResult_DiskCleanup.txt` 
 | `-UpdateCacheAgeDays` | `10` | Minimum age for Windows Update download payloads. |
 
 Age gates for the opt-in tasks are parameters of their own scripts — see
-[`Tasks\README.md`](Tasks/README.md).
+[`Tasks\_README.md`](Tasks/_README.md).
 
 ### Run control
 
@@ -214,7 +222,7 @@ Age gates for the opt-in tasks are parameters of their own scripts — see
 ### Opt-in tasks
 
 Not parameters of this script. Each is a separate procedure — see
-[`Tasks\README.md`](Tasks/README.md).
+[`Tasks\_README.md`](Tasks/_README.md).
 
 ### Suggested profiles
 
@@ -258,7 +266,7 @@ SUCCESS: Skipped - free space 84.11 GB already above 20 GB threshold.
 Stopped early once the target was met:
 
 ```
-SUCCESS: Reclaimed 14.02 GB. Free 6.10 GB -> 20.14 GB of 237.15 GB. Top: WindowsOld 9.77 GB, WindowsUpdateCache 2.88 GB, WindowsTemp 812.4 MB. Stopped early: free space target reached.
+SUCCESS: Reclaimed 14.02 GB. Free 6.10 GB -> 20.14 GB of 237.15 GB. Top: WindowsUpdateCache 9.77 GB, BrowserCache 2.88 GB, WindowsTemp 812.4 MB. Stopped early: free space target reached.
 ```
 
 Report-only:
@@ -278,7 +286,7 @@ FAILURE: Cannot find drive. A drive with the name 'C' does not exist.
 `C:\INS-Temp\Logs\DiskCleanup.log`
 
 ```
-[2026-08-20 02:14:03][INFO] === DiskCleanup v1.0 START ===
+[2026-08-20 02:14:03][INFO] === DiskCleanup v2.0.0 START ===
 [2026-08-20 02:14:03][INFO] Join type detected: Hybrid
 [2026-08-20 02:14:03][INFO] Running as: NT AUTHORITY\SYSTEM
 [2026-08-20 02:14:04][INFO] Free space before: 11.30 GB of 237.15 GB
@@ -286,8 +294,8 @@ FAILURE: Cannot find drive. A drive with the name 'C' does not exist.
 [2026-08-20 02:14:05][INFO] --- Task start: WindowsTemp
 [2026-08-20 02:14:41][INFO] WindowsTemp: Reclaimed 812.4 MB from 3,204 items (17 skipped/locked). Files older than 2 day(s).
 [2026-08-20 02:14:41][INFO] --- Task start: UserTemp
-[2026-08-20 02:15:18][INFO] Protected extension preserved: C:\Users\jsmith\AppData\Local\Temp\archive_backup.pst
 [2026-08-20 02:15:52][INFO] UserTemp: Reclaimed 1.28 GB from 8,911 items (43 skipped/locked). Across 3 profile(s), older than 2 day(s).
+[2026-08-20 02:15:52][INFO] Task 'UserTemp': 1 file(s) preserved by protected-extension rule.
 [2026-08-20 02:15:52][INFO] --- Task start: UserInternetCache
 [2026-08-20 02:16:09][INFO] UserInternetCache: Reclaimed 96.2 MB from 1,442 items (6 skipped/locked). 
 [2026-08-20 02:16:09][INFO] --- Task start: WindowsErrorReporting
@@ -307,7 +315,7 @@ FAILURE: Cannot find drive. A drive with the name 'C' does not exist.
 [2026-08-20 02:17:30][INFO] Restarted service 'wuauserv'.
 [2026-08-20 02:17:31][INFO] Restarted service 'bits'.
 [2026-08-20 02:17:31][INFO] --- Task start: ThumbnailCache
-[2026-08-20 02:17:31][INFO] ThumbnailCache: Reclaimed 0 B from 0 items (3 skipped/locked). Skipped: an interactive session is active (cache files are locked).
+[2026-08-20 02:17:31][INFO] ThumbnailCache: Reclaimed 0 B from 0 items (0 skipped/locked). An interactive session is active (cache files are locked).
 [2026-08-20 02:17:31][INFO] --- Task start: BrowserCache
 [2026-08-20 02:18:47][INFO] BrowserCache: Reclaimed 2.14 GB from 24,183 items (91 skipped/locked). Cache folders only - cookies, passwords, history and bookmarks untouched. Skipped (running): Chrome.
 [2026-08-20 02:18:48][INFO] Free space after: 19.72 GB (delta 8.42 GB; tasks reported 8.42 GB)
@@ -317,8 +325,8 @@ FAILURE: Cannot find drive. A drive with the name 'C' does not exist.
 A rejected path looks like this — worth grepping for after any edit to the task list:
 
 ```
-[2026-08-20 02:14:05][WARN] Path rejected (user profile data outside AppData): C:\Users\jsmith\Downloads
-[2026-08-20 02:14:05][WARN] Path rejected (reparse point): C:\Users\jsmith\AppData\Local\Application Data
+[2026-08-20 02:14:05][WARN] Path rejected (user profile data outside AppData: C:\Users\jsmith\Downloads)
+[2026-08-20 02:14:05][WARN] Path rejected (reparse point: C:\Users\jsmith\AppData\Local\Application Data)
 ```
 
 ### 5.3 JSON summary
@@ -328,7 +336,7 @@ A rejected path looks like this — worth grepping for after any edit to the tas
 ```json
 {
   "Script": "DiskCleanup",
-  "Version": "1.0",
+  "Version": "2.0.0",
   "Computer": "WKS-FIN-014",
   "JoinType": "Hybrid",
   "TimestampUtc": "2026-08-20T02:18:48",
@@ -344,7 +352,7 @@ A rejected path looks like this — worth grepping for after any edit to the tas
     { "Task": "WindowsTemp", "Bytes": 851884032, "Items": 3204, "Failed": 17, "Status": "OK", "Detail": "Files older than 2 day(s)." },
     { "Task": "UserTemp", "Bytes": 1374389534, "Items": 8911, "Failed": 43, "Status": "OK", "Detail": "Across 3 profile(s), older than 2 day(s)." },
     { "Task": "WindowsUpdateCache", "Bytes": 4198154240, "Items": 2048, "Failed": 0, "Status": "OK", "Detail": "Payloads older than 10 day(s)." },
-    { "Task": "ThumbnailCache", "Bytes": 0, "Items": 0, "Failed": 3, "Status": "OK", "Detail": "Skipped: an interactive session is active (cache files are locked)." },
+    { "Task": "ThumbnailCache", "Bytes": 0, "Items": 0, "Failed": 0, "Status": "SKIPPED", "Detail": "An interactive session is active (cache files are locked)." },
     { "Task": "BrowserCache", "Bytes": 2297659392, "Items": 24183, "Failed": 91, "Status": "OK", "Detail": "Cache folders only - cookies, passwords, history and bookmarks untouched. Skipped (running): Chrome." }
   ]
 }
@@ -403,11 +411,10 @@ A reasonable pattern:
 - **On low-disk alert:** targeted profile with `-StopWhenFreeSpaceGB` set to your alert clear
   threshold, so it stops as soon as the alert would clear.
 - **Quarterly / change window:** the opt-in task procedures, particularly
-  `Tasks\Invoke-ComponentCleanup.ps1`. See [`Tasks\README.md`](Tasks/README.md).
+  `Tasks\Invoke-ComponentCleanup.ps1`. See [`Tasks\_README.md`](Tasks/_README.md).
 
-Passing switch parameters from VSA is done by including or omitting the switch text in the argument
-string; there is no `-Switch:$true` needed. If you build the argument line from a VSA variable,
-confirm the expanded command in the agent procedure log before rolling out.
+If you build the argument line from a VSA variable, confirm the expanded command in the agent
+procedure log before rolling out.
 
 ---
 
@@ -446,8 +453,8 @@ low on disk. Collect the JSON summaries.
   opt-ins are worth the risk conversation at all.
 - Any `Path rejected` warnings that suggest an environment-specific layout (folder redirection,
   FSLogix, non-standard profile paths).
-- Any `Protected extension preserved` lines — these tell you where users are storing real data in
-  places they shouldn't, which is worth knowing independently.
+- Any `preserved by protected-extension rule` lines — these tell you where users are storing real
+  data in places they shouldn't, which is worth knowing independently.
 
 ### Phase 2 — Safe defaults (2 weeks, one department)
 
@@ -463,7 +470,7 @@ opt-ins or a bigger disk.
 ### Phase 4 — Opt-in tasks, individually
 
 Introduce one task procedure at a time, each with its own pilot. Suggested order and the
-per-task caveats are in [`Tasks\README.md`](Tasks/README.md) §6.
+per-task caveats are in [`Tasks\_README.md`](Tasks/_README.md) §6.
 
 `Clear-AgedRecycleBin` and `Remove-StaleProfile` are the two that generate help desk tickets.
 Both deserve a user-facing communication before they go fleet-wide.

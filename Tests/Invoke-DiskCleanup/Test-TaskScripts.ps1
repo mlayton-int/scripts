@@ -121,10 +121,60 @@ try {
     }
 
     # ══ Comment-based help must render for all 7 ══════════════════════════════
+    # Two separate assertions, because they fail on different things:
+    #
+    #   'help renders'  - the rendered text contains a DESCRIPTION section. Catches the
+    #                     PS 5.1 quirk where a non-blank line abutting <# suppresses the
+    #                     whole block.
+    #   'real SYNOPSIS' - the script actually supplies .SYNOPSIS. Matching the literal
+    #                     'SYNOPSIS' in rendered help does NOT test this: Get-Help emits
+    #                     that header regardless. The old check did exactly that and
+    #                     passed vacuously on the main script, which had no .SYNOPSIS at
+    #                     all. See Test-ScriptSynopsis for why "non-empty" is also not
+    #                     enough on its own.
     foreach ($s in $scripts) {
         $h = Get-ScriptHelpText -Path $s.File
-        Add-TestCheck "$($s.Name) : help has SYNOPSIS" $true ([bool]($h -match 'SYNOPSIS'))
+        Add-TestCheck "$($s.Name) : help renders"   $true ([bool]($h -match 'DESCRIPTION'))
+        Add-TestCheck "$($s.Name) : real SYNOPSIS"  $true (Test-ScriptSynopsis -Path $s.File)
     }
+
+    # ══ Version must agree between the help block and $ScriptVersion ══════════
+    # $ScriptVersion is what reaches the log header and the summary JSON, so a help
+    # block claiming a different number is a silent lie to whoever reads the file. These
+    # drifted apart once already (help 2.0.0 vs $ScriptVersion 1.0.1).
+    foreach ($s in $scripts) {
+        $raw    = Get-Content -LiteralPath $s.File -Raw
+        $inHelp = if ($raw -match 'Version\s*:\s*([0-9]+\.[0-9]+\.[0-9]+)') { $Matches[1] } else { '(none)' }
+        $inCode = if ($raw -match "ScriptVersion\s*=\s*'([0-9]+\.[0-9]+\.[0-9]+)'") { $Matches[1] } else { '(none)' }
+        Add-TestCheck "$($s.Name) : help version == `$ScriptVersion" $inCode $inHelp
+    }
+
+    # ══ Relative doc links must resolve ══════════════════════════════════════
+    # Tasks\README.md was renamed to Tasks\_README.md and 9 referrers were left pointing
+    # at the old name - 8 markdown links here plus one prose reference in the script's
+    # own help. Nothing caught it because a broken link costs nothing at runtime.
+    $docs = @(
+        (Join-Path (Get-RepoRoot) 'Invoke-DiskCleanup\Invoke-DiskCleanup-README.md')
+        (Join-Path (Get-RepoRoot) 'Invoke-DiskCleanup\Tasks\_README.md')
+        (Join-Path (Get-RepoRoot) 'Invoke-DiskCleanup\Invoke-DiskCleanup-CHANGELOG.md')
+    )
+    $badLinks = New-Object System.Collections.Generic.List[string]
+    foreach ($doc in $docs) {
+        if (-not (Test-Path -LiteralPath $doc)) { continue }
+        $docDir = Split-Path $doc -Parent
+        foreach ($m in ([regex]'\]\(([^)]+)\)').Matches((Get-Content -LiteralPath $doc -Raw))) {
+            $target = $m.Groups[1].Value
+            # Skip absolute URLs and pure in-page anchors; strip any #fragment.
+            if ($target -match '^(https?|mailto):' -or $target.StartsWith('#')) { continue }
+            $target = ($target -split '#')[0]
+            if (-not $target) { continue }
+            if (-not (Test-Path -LiteralPath (Join-Path $docDir $target))) {
+                $badLinks.Add("$(Split-Path $doc -Leaf) -> $target")
+            }
+        }
+    }
+    Add-TestCheck 'docs: every relative link resolves' 0 $badLinks.Count
+    if ($badLinks.Count -gt 0) { $badLinks | ForEach-Object { Write-Warning "broken link: $_" } }
 
     # ══ Rotation isolation: main must not prune a task's archives ════════════
     $taskArchive = Join-Path $logDir 'DiskCleanup_RestorePoints-20200101_000000.log'

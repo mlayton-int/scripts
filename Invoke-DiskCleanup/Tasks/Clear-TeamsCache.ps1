@@ -268,19 +268,16 @@ function Clear-PathAgedFiles {
         [switch]$RemoveEmptyDirs
     )
 
-    $result = [PSCustomObject]@{
-        Bytes = [double]0; Items = 0; Failed = 0; Skipped = $false
-        SkipReason = ''; ProtectedSkipped = 0
-    }
+    # Only these three fields; every caller reads exactly these. Earlier versions also
+    # carried Skipped/SkipReason/ProtectedSkipped, which nothing ever read - the real
+    # diagnostic channel is $script:PathSkips / $script:ProtectedSkips below.
+    $result = [PSCustomObject]@{ Bytes = [double]0; Items = 0; Failed = 0 }
 
-    if (-not (Test-Path -LiteralPath $Path)) {
-        $result.Skipped = $true; $result.SkipReason = "path not present: $Path"
-        return $result
-    }
+    # A missing path is not an error - most cleanup targets are absent on most machines.
+    if (-not (Test-Path -LiteralPath $Path)) { return $result }
 
     $why = ''
     if (-not (Test-SafeCleanupPath -Path $Path -Reason ([ref]$why))) {
-        $result.Skipped = $true; $result.SkipReason = $why
         $script:PathSkips.Add($why)
         return $result
     }
@@ -311,7 +308,6 @@ function Clear-PathAgedFiles {
 
                 if ($entry.LastWriteTime -ge $cutoff) { continue }
                 if ($ProtectedExtensions -contains $entry.Extension.ToLower()) {
-                    $result.ProtectedSkipped++
                     $script:ProtectedSkips++
                     continue
                 }
